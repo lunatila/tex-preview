@@ -2,15 +2,16 @@
 
 A Claude Code mod that shows the compiled PDF of the LaTeX document Claude is editing, in a pane beside the chat.
 
-Whenever Claude edits or writes a `.tex` file, the mod compiles the document and draws the page the edit landed on (found with SyncTeX). Compile errors show at the top of the pane with their file and line, and the last good page stays on screen.
+Whenever Claude edits or writes a `.tex` file, the mod compiles the document and shows its pages one under the other, scrolled to the page the edit landed on (found with SyncTeX). Compile errors show at the top of the pane with their file and line, and the last good pages stay on screen.
 
 - **Finds the main file of a chapter**: a `% !TEX root = main.tex` comment, or else a `.tex` with `\documentclass` in the same folder or the one above that `\input`s or `\include`s the chapter.
 - **Fast first**: one pass of the engine shows the edit right away; when the log asks for another run (references, citations, bibliography), `latexmk` settles it in the background.
 - **Engine**: `pdflatex` by default; `xelatex` or `lualatex` with `% !TEX program = ...`, and `xelatex` when the document loads `fontspec`.
-- **Pane buttons**: ◀ ▶ to change page (neighbouring pages are rendered ahead), **Recompilar**, and **Abrir PDF** to open it in your PDF viewer.
+- **Scroll to read**: the pane holds the 10 pages either side of the edit; in a longer document, **▲** and **▼** load 10 more at either end. The edited page is drawn first, and pages still rendering keep their place, so nothing jumps.
+- **Pane buttons**: **Recompilar**, and **Abrir PDF** to open it in your PDF viewer.
 - **Command**: `/tex path/to/file.tex` compiles a file and opens the pane at any time; `/tex` alone recompiles the current one.
 
-The page is drawn as an image, in color when it fits the pane's size limit and in grayscale otherwise. It only reacts to Claude's edits: after editing in your own editor, press **Recompilar** or run `/tex`.
+Pages are drawn as grayscale images, which keeps a page of text near 50 KB so a run of them stays quick; open the PDF to see figures in color. It only reacts to Claude's edits: after editing in your own editor, press **Recompilar** or run `/tex`.
 
 ## Requirements
 

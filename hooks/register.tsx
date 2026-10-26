@@ -6,20 +6,31 @@ import type { TexPreviewPage, TexPreviewView } from '../types'
 const PANE = 'tex-preview'
 // An Svg's source holds at most 131072 characters, the PNG's base64 included.
 const SVG_ROOM = 130_000
-// Best first; a page whose PNG does not fit falls to the next.
-const RENDERS: string[][] = [
-  ['-png', '-scale-to-x', '760'],
-  ['-png', '-gray', '-scale-to-x', '800'],
+// Grayscale keeps a page of text near 50 KB, so a window of pages stays light;
+// a page that still does not fit falls through the smaller ones.
+const RENDER = ['-png', '-gray', '-scale-to-x', '800']
+const FALLBACKS: string[][] = [
   ['-png', '-gray', '-scale-to-x', '640'],
   ['-png', '-mono', '-scale-to-x', '800'],
   ['-png', '-gray', '-scale-to-x', '480'],
 ]
+// Pages drawn either side of the one edited, and how many a press adds.
+const RADIUS = 10
+const MORE = 10
 // Short enough to feel immediate, long enough to fold a burst of edits.
 const SETTLE_MS = 250
 // What a quick single pass leaves for latexmk to settle.
 const UNSETTLED = /Rerun to get|There were undefined (references|citations)|Label\(s\) may have changed|No file .*\.(bbl|ind|gls)/
 
-const INITIAL: TexPreviewView = { page: 1, pages: 0, status: 'idle', errors: [] }
+const INITIAL: TexPreviewView = {
+  pages: 0,
+  first: 1,
+  last: 0,
+  focus: 1,
+  images: {},
+  status: 'idle',
+  errors: [],
+}
 const view = atom({ plugin: 'tex-preview', key: 'view' } as const, INITIAL)
 
 type Jump = { file: string; line: number }
@@ -33,8 +44,6 @@ let pendingEdit: Edit | undefined
 let isPending = false
 // The module's own caches: a reload starts them over, which costs one lookup.
 const roots = new Map<string, string>()
-const pages = new Map<string, TexPreviewPage>()
-let firstRender = 0
 let tmp: string | undefined
 let opener: string[] | undefined
 
@@ -44,6 +53,7 @@ const baseOf = (path: string) => slash(path).replace(/^.*\//, '')
 const stemOf = (path: string) => baseOf(path).replace(/\.tex$/i, '')
 const isTex = (path: unknown): path is string =>
   typeof path === 'string' && /\.tex$/i.test(path)
+const clamp = (n: number, low: number, high: number) => Math.min(Math.max(n, low), high)
 
 const readText = (path: string, $: EngineInterface) =>
   $.fs.read(path).then(
@@ -158,32 +168,54 @@ async function cacheDir($: EngineInterface): Promise<string> {
   return dir
 }
 
-async function renderPage(
-  $: EngineInterface,
-  pdf: string,
-  page: number,
-): Promise<TexPreviewPage | undefined> {
-  const cached = pages.get(`${pdf}#${page}`)
-  if (cached !== undefined) return cached
+async function readPng($: EngineInterface, path: string): Promise<TexPreviewPage | undefined> {
+  const bytes = await $.fs.read(path, { as: 'bytes' }).catch(() => undefined)
+  if (bytes === undefined || bytes.base64.length > SVG_ROOM) return undefined
 
-  const out = `${await cacheDir($)}/page-${page}`
-  // Start where the last page fit, so a document of dense pages pays no
-  // failed attempt each time; a page that fits easily lets the next try better.
-  for (let i = firstRender; i < RENDERS.length; i++) {
-    const options = RENDERS[i] ?? []
+  return { base64: bytes.base64, ...pngSize(bytes.base64) }
+}
+
+// One page alone, falling to smaller renders until it fits an Svg.
+async function renderPage($: EngineInterface, pdf: string, page: number): Promise<TexPreviewPage | undefined> {
+  const out = `${await cacheDir($)}/page`
+  for (const options of [RENDER, ...FALLBACKS]) {
     const argv = ['pdftocairo', ...options, '-scale-to-y', '-1', '-f', `${page}`, '-l', `${page}`]
     const ran = await $.process.run([...argv, '-singlefile', pdf, out], { timeoutMs: 60_000 })
     if (ran.exitCode !== 0) return undefined
-    const { base64 } = await $.fs.read(`${out}.png`, { as: 'bytes' })
-    if (base64.length > SVG_ROOM) continue
-    firstRender = base64.length < SVG_ROOM / 2 ? Math.max(0, i - 1) : i
-    const image = { base64, ...pngSize(base64) }
-    pages.set(`${pdf}#${page}`, image)
-
-    return image
+    const image = await readPng($, `${out}.png`)
+    if (image !== undefined) return image
   }
 
   return undefined
+}
+
+// A run of pages in one pdftocairo process; a page too large is redone alone.
+async function renderRange(
+  $: EngineInterface,
+  pdf: string,
+  first: number,
+  last: number,
+): Promise<Record<string, TexPreviewPage>> {
+  const images: Record<string, TexPreviewPage> = {}
+  if (last < first) return images
+  const dir = await cacheDir($)
+  const argv = ['pdftocairo', ...RENDER, '-scale-to-y', '-1', '-f', `${first}`, '-l', `${last}`]
+  const ran = await $.process.run([...argv, pdf, `${dir}/range`], { timeoutMs: 600_000 })
+  if (ran.exitCode !== 0) return images
+
+  // pdftocairo pads the page number to the document's width: range-07.png.
+  const written = (await $.fs.list(dir)).filter(entry => /^range-\d+\.png$/.test(entry.name))
+  for (let page = first; page <= last; page++) {
+    if (isPending) return images
+    const files = written
+      .filter(entry => Number(entry.name.slice(6, -4)) === page)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    const name = files[0]?.name
+    const image = (name && (await readPng($, `${dir}/${name}`))) || (await renderPage($, pdf, page))
+    if (image !== undefined) images[page] = image
+  }
+
+  return images
 }
 
 async function pageOf($: EngineInterface, pdf: string, jump: Jump): Promise<number | undefined> {
@@ -197,22 +229,59 @@ async function pageOf($: EngineInterface, pdf: string, jump: Jump): Promise<numb
   return page ? Number(page) : undefined
 }
 
-async function showPage($: EngineInterface, page: number) {
-  const { pdf, pages: count } = await read($, view)
-  if (pdf === undefined) return
-  const target = Math.min(Math.max(1, page), Math.max(1, count))
-  const image = await renderPage($, pdf, target)
-  await update($, view, v => ({ ...v, page: target, image: image ?? v.image }))
+const reveal = ($: EngineInterface, page: number) =>
+  $.ui.scroll({ in: PANE, to: { key: `page-${page}` }, block: 'start' }).catch(() => undefined)
+
+// Draws the window around the focus: the focus page first and scrolled to,
+// then the rest in one run. Pages already drawn stay up until replaced.
+async function showPages($: EngineInterface, focus?: number) {
+  const before = await read($, view)
+  const { pdf, pages: count } = before
+  if (pdf === undefined || count === 0) return
+  const target = clamp(focus ?? before.focus, 1, count)
+  const isSameWindow = target >= before.first && target <= before.last
+  const first = isSameWindow ? Math.max(1, before.first) : Math.max(1, target - RADIUS)
+  const last = isSameWindow ? Math.min(count, before.last) : Math.min(count, target + RADIUS)
+
+  const shown = await renderPage($, pdf, target)
+  await update($, view, v => ({
+    ...v,
+    first,
+    last,
+    focus: target,
+    images: shown ? { ...v.images, [target]: shown } : v.images,
+  }))
+  void reveal($, target)
+  if (isPending) return
+
+  const rest = {
+    ...(await renderRange($, pdf, first, target - 1)),
+    ...(await renderRange($, pdf, target + 1, last)),
+  }
+  if (isPending) return
+  await update($, view, v => {
+    const images: Record<string, TexPreviewPage> = {}
+    for (let page = v.first; page <= v.last; page++) {
+      const image = page === target ? shown : rest[page]
+      if (image !== undefined) images[page] = image
+    }
+    return { ...v, images }
+  })
 }
 
-// The pages either side of the one shown, so paging through is instant.
-async function prefetch($: EngineInterface) {
-  const { pdf, page, pages: count } = await read($, view)
+// A press on "more": widen the window by MORE pages at one end.
+async function widen($: EngineInterface, side: 'up' | 'down') {
+  const { pdf, first, last, pages: count } = await read($, view)
   if (pdf === undefined) return
-  for (const near of [page + 1, page - 1]) {
-    if (isPending) return
-    if (near >= 1 && near <= count) await renderPage($, pdf, near).catch(() => undefined)
-  }
+  const from = side === 'up' ? Math.max(1, first - MORE) : last + 1
+  const to = side === 'up' ? first - 1 : Math.min(count, last + MORE)
+  const added = await renderRange($, pdf, from, to)
+  await update($, view, v => ({
+    ...v,
+    first: Math.min(v.first, from),
+    last: Math.max(v.last, to),
+    images: { ...v.images, ...added },
+  }))
 }
 
 type Pass = { exitCode: number; stdout: string; stderr: string }
@@ -224,7 +293,7 @@ async function run($: EngineInterface, argv: string[], cwd: string): Promise<Pas
 }
 
 // Reads what a pass left and shows it; answers whether the log asks for more.
-async function settle($: EngineInterface, root: string, ran: Pass, page?: number): Promise<boolean> {
+async function settle($: EngineInterface, root: string, ran: Pass, focus?: number): Promise<boolean> {
   const dir = dirOf(root)
   const pdf = `${dir}/${stemOf(root)}.pdf`
   const log = await readText(`${dir}/${stemOf(root)}.log`, $)
@@ -234,24 +303,30 @@ async function settle($: EngineInterface, root: string, ran: Pass, page?: number
     errors.push((ran.stderr || ran.stdout).trim().split(/\r?\n/).slice(-4).join('\n') || 'a compilação falhou')
   }
   const hasPdf = await $.fs.exists(pdf)
-  for (const key of [...pages.keys()]) if (key.startsWith(`${pdf}#`)) pages.delete(key)
   const status: TexPreviewView['status'] = ran.exitCode === 0 ? 'ok' : 'error'
-  await update($, view, v => ({
-    ...v,
-    root,
-    pdf: hasPdf ? pdf : v.pdf,
-    pages: count || v.pages,
-    status,
-    errors,
-    updatedAt: Date.now(),
-  }))
-  if (hasPdf) await showPage($, page ?? (await read($, view)).page)
+  await update($, view, v => {
+    // Another document starts over; the same one keeps its pages up meanwhile.
+    const isOther = v.root !== root
+    return {
+      ...v,
+      root,
+      pdf: hasPdf ? pdf : v.pdf,
+      pages: count || v.pages,
+      first: isOther ? 1 : v.first,
+      last: isOther ? 0 : Math.min(v.last, count || v.last),
+      images: isOther ? {} : v.images,
+      status,
+      errors,
+      updatedAt: Date.now(),
+    }
+  })
+  if (hasPdf) await showPages($, focus)
 
   return ran.exitCode === 0 && UNSETTLED.test(log)
 }
 
 async function compile($: EngineInterface, root: string, edit: Edit | undefined) {
-  await update($, view, (v): TexPreviewView => ({ ...v, root, status: 'compiling', isRefining: false }))
+  await update($, view, (v): TexPreviewView => ({ ...v, status: 'compiling', isRefining: false }))
   const dir = dirOf(root)
   const program = programOf(await readText(root, $))
   const flags = ['-interaction=nonstopmode', '-file-line-error', '-synctex=1']
@@ -260,8 +335,8 @@ async function compile($: EngineInterface, root: string, edit: Edit | undefined)
   const quick = await run($, [program.engine, ...flags, baseOf(root)], dir)
   const jump = edit && (await jumpOf($, edit))
   const pdf = `${dir}/${stemOf(root)}.pdf`
-  const page = jump && (await pageOf($, pdf, jump))
-  const needsMore = await settle($, root, quick, page)
+  const focus = jump && (await pageOf($, pdf, jump))
+  const needsMore = await settle($, root, quick, focus)
   if (!needsMore || isPending) return
 
   // latexmk then settles references, citations and the bibliography.
@@ -284,7 +359,6 @@ async function drain($: EngineInterface) {
       isPending = false
       if (root !== undefined) await compile($, root, edit)
     }
-    await prefetch($)
   } finally {
     isRunning = false
   }
@@ -309,6 +383,17 @@ async function openPdf($: EngineInterface, pdf: string) {
   const path = opener[0] === 'cmd' ? pdf.replace(/\//g, '\\') : pdf
   await $.process.run([...opener, path]).catch(() => $.ui.toast(`Não consegui abrir ${pdf}`))
 }
+
+const pageSvg = (image: TexPreviewPage) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${image.width} ${image.height}" width="${image.width}" height="${image.height}">` +
+  `<rect width="100%" height="100%" fill="#fff"/>` +
+  `<image href="data:image/png;base64,${image.base64}" width="${image.width}" height="${image.height}"/></svg>`
+
+// A page still rendering holds its place, so the pages below do not jump.
+const placeholderSvg = (size: { width: number; height: number }, page: number) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size.width} ${size.height}" width="${size.width}" height="${size.height}">` +
+  `<rect width="100%" height="100%" fill="#f4f4f4"/>` +
+  `<text x="50%" y="50%" text-anchor="middle" font-family="sans-serif" font-size="28" fill="#999">página ${page}</text></svg>`
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -360,13 +445,10 @@ export const register: Register = on => {
     const label =
       v.status === 'compiling' ? 'compilando…'
       : v.status === 'error' ? 'erros na compilação'
-      : v.status === 'ok' ? `página ${v.page} de ${v.pages || '?'}${v.isRefining ? ' · atualizando referências…' : ''}`
+      : v.status === 'ok' ? `${v.pages} página${v.pages === 1 ? '' : 's'}${v.isRefining ? ' · atualizando referências…' : ''}`
       : 'aguardando um .tex'
-    const svg =
-      v.image &&
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${v.image.width} ${v.image.height}" width="${v.image.width}" height="${v.image.height}">` +
-      `<rect width="100%" height="100%" fill="#fff"/>` +
-      `<image href="data:image/png;base64,${v.image.base64}" width="${v.image.width}" height="${v.image.height}"/></svg>`
+    const sample = Object.values(v.images)[0]
+    const range = Array.from({ length: Math.max(0, v.last - v.first + 1) }, (_, i) => v.first + i)
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -377,8 +459,6 @@ export const register: Register = on => {
           </Text>
         </Box>
         <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="prev" label="◀" onPress={() => void showPage($, v.page - 1).then(() => prefetch($))} />
-          <Button key="next" label="▶" onPress={() => void showPage($, v.page + 1).then(() => prefetch($))} />
           <Button
             key="build"
             label="Recompilar"
@@ -397,8 +477,34 @@ export const register: Register = on => {
             ))}
           </Box>
         )}
-        {svg && Svg ? (
-          <Svg source={svg} alt={`Página ${v.page} de ${v.root ? baseOf(v.root) : 'PDF'}`} />
+        {Svg && sample ? (
+          <Box flexDirection="column" gap={1}>
+            {v.first > 1 && (
+              <Button
+                key="up"
+                label={`▲ páginas ${Math.max(1, v.first - MORE)}–${v.first - 1}`}
+                onPress={() => void widen($, 'up')}
+              />
+            )}
+            {range.map(page => {
+              const image = v.images[page]
+              return (
+                <Box key={`page-${page}`} flexDirection="column">
+                  <Svg
+                    source={image ? pageSvg(image) : placeholderSvg(sample, page)}
+                    alt={`Página ${page} de ${v.pages}`}
+                  />
+                </Box>
+              )
+            })}
+            {v.last < v.pages && (
+              <Button
+                key="down"
+                label={`▼ páginas ${v.last + 1}–${Math.min(v.pages, v.last + MORE)}`}
+                onPress={() => void widen($, 'down')}
+              />
+            )}
+          </Box>
         ) : (
           <Text dimColor>
             {v.pdf ? `PDF em ${v.pdf}` : 'Edite um .tex na conversa ou use /tex arquivo.tex.'}
