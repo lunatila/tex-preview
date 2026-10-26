@@ -1,0 +1,6 @@
+{
+  "name": "tex-preview",
+  "version": "0.1.0",
+  "description": "Compiles the .tex Claude edits and shows the page it changed in a pane beside the chat",
+  "types": "./types/index.d.ts"
+}

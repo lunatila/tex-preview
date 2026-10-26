@@ -1,0 +1,33 @@
+# tex-preview
+
+A Claude Code mod that shows the compiled PDF of the LaTeX document Claude is editing, in a pane beside the chat.
+
+Whenever Claude edits or writes a `.tex` file, the mod compiles the document and draws the page the edit landed on (found with SyncTeX). Compile errors show at the top of the pane with their file and line, and the last good page stays on screen.
+
+- **Finds the main file of a chapter**: a `% !TEX root = main.tex` comment, or else a `.tex` with `\documentclass` in the same folder or the one above that `\input`s or `\include`s the chapter.
+- **Fast first**: one pass of the engine shows the edit right away; when the log asks for another run (references, citations, bibliography), `latexmk` settles it in the background.
+- **Engine**: `pdflatex` by default; `xelatex` or `lualatex` with `% !TEX program = ...`, and `xelatex` when the document loads `fontspec`.
+- **Pane buttons**: ◀ ▶ to change page (neighbouring pages are rendered ahead), **Recompilar**, and **Abrir PDF** to open it in your PDF viewer.
+- **Command**: `/tex path/to/file.tex` compiles a file and opens the pane at any time; `/tex` alone recompiles the current one.
+
+The page is drawn as an image, in color when it fits the pane's size limit and in grayscale otherwise. It only reacts to Claude's edits: after editing in your own editor, press **Recompilar** or run `/tex`.
+
+## Requirements
+
+A TeX distribution with `latexmk`, `pdftocairo` and `synctex` on the `PATH` (a full TeX Live install has all three; on macOS, MacTeX). The pane needs the Claude desktop app or the VS Code extension; the terminal shows the PDF's path instead.
+
+## Install
+
+At the prompt of a terminal session:
+
+```
+/plugin install tex-preview --marketplace lunatila/tex-preview
+```
+
+From a shell:
+
+```bash
+claude plugin install tex-preview --marketplace lunatila/tex-preview
+```
+
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `lunatila/tex-preview`, then Add plugin.

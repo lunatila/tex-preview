@@ -1,0 +1,5 @@
+{
+  "name": "tex-preview",
+  "owner": { "name": "lunatila" },
+  "plugins": [{ "name": "tex-preview", "source": "./" }]
+}
