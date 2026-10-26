@@ -32,7 +32,11 @@ test('editing a chapter compiles its root and shows the page it lands on', async
   })
   on('clock.after', () => ({ value: undefined }))
   on('env.get', () => ({ value: 'C:/Temp' }))
-  on('fs.write', () => ({ value: undefined }))
+  const written: { path: string; text: string }[] = []
+  on('fs.write', (_, e) => {
+    if (!e.path.endsWith('.keep')) written.push({ path: e.path.replace(/\\/g, '/'), text: e.text })
+    return { value: undefined }
+  })
   on('fs.exists', () => ({ value: true }))
   on('fs.list', () => ({
     value: [
@@ -75,6 +79,22 @@ test('editing a chapter compiles its root and shows the page it lands on', async
 
   const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await desktop.find({ type: 'Text', text: /página/ }))?.text).toBe('página 2 de 3')
+  expect(await desktop.find({ type: 'Svg' })).toBeDefined()
+
+  // The editor opens the file Claude last edited; Enter saves and recompiles.
+  await desktop.press({ key: 'edit' })
+  expect((await desktop.find({ key: 'source' }))?.text).toBe('one\ntwo\n\\section{Novo}\nthree\n')
+  const changed = 'one\ntwo\n\\section{Mudado}\nthree\n'
+  await desktop.input({ key: 'source', text: changed, kind: 'change' })
+  expect(await desktop.find({ type: 'Text', text: /não salvo/ })).toBeDefined()
+  const passes = ran.filter(argv => argv[0] === 'pdflatex').length
+  await desktop.input({ key: 'source', text: changed })
+  expect(written).toContainEqual({ path: CHAPTER, text: changed })
+  for (let i = 0; i < 100 && ran.filter(argv => argv[0] === 'pdflatex').length === passes; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  expect(ran.filter(argv => argv[0] === 'pdflatex')).toHaveLength(passes + 1)
+  // Back on the PDF once saved.
   expect(await desktop.find({ type: 'Svg' })).toBeDefined()
   await desktop.unmount()
 

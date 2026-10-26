@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TexPreviewPage, TexPreviewView } from '../types'
+import type { TexPreviewPage, TexPreviewSource, TexPreviewView } from '../types'
 
 const PANE = 'tex-preview'
 // An Svg's source holds at most 131072 characters, the PNG's base64 included.
@@ -16,6 +16,9 @@ const RENDERS: string[][] = [
 ]
 // Short enough to feel immediate, long enough to fold a burst of edits.
 const SETTLE_MS = 250
+// The text a tree's Inputs hold together; a longer file is not opened in the
+// editor, since the field would hold only its head and a save would cut it.
+const INPUT_ROOM = 100_000
 // What a quick single pass leaves for latexmk to settle.
 const UNSETTLED = /Rerun to get|There were undefined (references|citations)|Label\(s\) may have changed|No file .*\.(bbl|ind|gls)/
 
@@ -93,7 +96,7 @@ async function lookUpRoot($: EngineInterface, file: string): Promise<string> {
 // The line of the first character the edit changed, not of the context it kept.
 async function jumpOf($: EngineInterface, edit: Edit): Promise<Jump | undefined> {
   if (edit.newText === '') return undefined
-  const text = await readText(edit.file, $)
+  const text = (await readText(edit.file, $)).replace(/\r\n/g, '\n')
   const at = text.indexOf(edit.newText)
   if (at < 0) return undefined
   let kept = 0
@@ -310,6 +313,67 @@ async function openPdf($: EngineInterface, pdf: string) {
   await $.process.run([...opener, path]).catch(() => $.ui.toast(`Não consegui abrir ${pdf}`))
 }
 
+// The document's .tex files: its folder and the folders just below (chapters/).
+async function texFiles($: EngineInterface, root: string): Promise<string[]> {
+  const top = dirOf(root)
+  const found: string[] = []
+  const entries = await $.fs.list(top).catch(() => [])
+  for (const entry of entries) {
+    if (entry.kind === 'file' && isTex(entry.name)) found.push(`${top}/${entry.name}`)
+    if (entry.kind !== 'dir' || entry.name.startsWith('.')) continue
+    for (const inner of await $.fs.list(`${top}/${entry.name}`).catch(() => [])) {
+      if (inner.kind === 'file' && isTex(inner.name)) found.push(`${top}/${entry.name}/${inner.name}`)
+    }
+  }
+
+  return found.sort().slice(0, 60)
+}
+
+async function readSource($: EngineInterface, path: string): Promise<TexPreviewSource> {
+  const raw = await readText(path, $)
+  const text = raw.replace(/\r\n/g, '\n')
+
+  return { path, text, draft: text, isCrlf: raw.includes('\r\n') }
+}
+
+async function openSource($: EngineInterface, path: string) {
+  const source = await readSource($, path)
+  const { root } = await read($, view)
+  const files = root ? await texFiles($, root) : [path]
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    mode: 'source',
+    source,
+    files: files.includes(path) ? files : [path, ...files],
+  }))
+}
+
+// Writes the draft, then shows the PDF at the first line it changed.
+async function saveSource($: EngineInterface, draft: string) {
+  const { source } = await read($, view)
+  if (source === undefined) return
+  await $.fs.write(source.path, source.isCrlf ? draft.replace(/\n/g, '\r\n') : draft)
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    mode: 'pdf',
+    source: v.source && { ...v.source, text: draft, draft, isStale: false },
+  }))
+  pendingEdit = { file: source.path, oldText: source.text, newText: draft }
+  schedule($)
+}
+
+// Claude edited the open file: take its version, unless the person has typed.
+async function onDiskChange($: EngineInterface, path: string) {
+  const { source } = await read($, view)
+  if (source === undefined || source.path !== path) return
+  if (source.draft === source.text) {
+    const fresh = await readSource($, path)
+    await update($, view, v => ({ ...v, source: fresh }))
+  } else {
+    await update($, view, v => ({ ...v, source: v.source && { ...v.source, isStale: true } }))
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -347,6 +411,8 @@ export const register: Register = on => {
     pendingEdit = { file: slash(file), oldText, newText }
     void $.ui.open({ id: PANE, title: `PDF · ${baseOf(roots.get(slash(file)) ?? file)}` })
     schedule($)
+    await update($, view, v => ({ ...v, lastFile: slash(file) }))
+    await onDiskChange($, slash(file))
 
     return ran
   }).catch(($, e, next) => next(e))
@@ -357,6 +423,84 @@ export const register: Register = on => {
     // The terminal draws no Svg; it gets the PDF's path instead.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
     const v = await read($, view)
+    const Input = 'Input' in table ? table.Input : undefined
+    const Select = 'Select' in table ? table.Select : undefined
+
+    if (v.mode === 'source' && v.source) {
+      const source = v.source
+      const files = v.files ?? []
+      const isDirty = source.draft !== source.text
+      const isTooLong = source.text.length > INPUT_ROOM
+      const top = v.root ? `${dirOf(v.root)}/` : ''
+      const rows = Math.max(10, e.props.scroll.bodyRows - 8)
+      const setDraft = (draft: string) =>
+        update($, view, x => ({ ...x, source: x.source && { ...x.source, draft } }))
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            <Text bold>{baseOf(source.path)}</Text>
+            <Text dimColor>
+              {isDirty ? 'não salvo · Enter salva, Shift+Enter quebra a linha' : 'sem mudanças'}
+            </Text>
+          </Box>
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            <Button
+              key="pdf"
+              label="Ver PDF"
+              onPress={() => void update($, view, (x): TexPreviewView => ({ ...x, mode: 'pdf' }))}
+            />
+            {!isTooLong && (
+              <Button
+                key="save"
+                variant="primary"
+                label="Salvar e compilar"
+                onPress={() => void saveSource($, source.draft)}
+              />
+            )}
+            {isDirty && <Button key="discard" label="Descartar" onPress={() => void setDraft(source.text)} />}
+          </Box>
+          {Select && files.length > 1 && (
+            <Select
+              key="file"
+              label="Arquivo"
+              value={source.path}
+              options={files.map(path => ({
+                value: path,
+                label: path.startsWith(top) ? path.slice(top.length) : baseOf(path),
+              }))}
+              onSelect={path => {
+                if (isDirty) $.ui.toast('Salve ou descarte as mudanças antes de trocar de arquivo.')
+                else void openSource($, path)
+              }}
+            />
+          )}
+          {source.isStale && (
+            <Box flexDirection="row" gap={1} flexWrap="wrap">
+              <Text color="yellow">O Claude mudou este arquivo enquanto você editava.</Text>
+              <Button key="reload" label="Usar a versão do Claude" onPress={() => void openSource($, source.path)} />
+            </Box>
+          )}
+          {isTooLong || !Input ? (
+            <Text color="yellow">
+              {isTooLong
+                ? `Este arquivo tem ${source.text.length} caracteres, mais do que o editor do painel comporta (${INPUT_ROOM}). Edite-o no seu editor.`
+                : 'Esta superfície não tem campo de texto: edite o arquivo no seu editor.'}
+            </Text>
+          ) : (
+            <Input
+              key="source"
+              rows={rows}
+              value={source.draft}
+              submitLabel="salvar"
+              onInput={draft => void setDraft(draft)}
+              onSubmit={draft => void saveSource($, draft)}
+            />
+          )}
+        </Box>
+      )
+    }
+
     const label =
       v.status === 'compiling' ? 'compilando…'
       : v.status === 'error' ? 'erros na compilação'
@@ -389,6 +533,16 @@ export const register: Register = on => {
             }}
           />
           {v.pdf && <Button key="open" label="Abrir PDF" onPress={() => v.pdf && void openPdf($, v.pdf)} />}
+          {Input && (v.lastFile ?? v.root) && (
+            <Button
+              key="edit"
+              label="Editar .tex"
+              onPress={() => {
+                const path = v.lastFile ?? v.root
+                if (path) void openSource($, path)
+              }}
+            />
+          )}
         </Box>
         {v.errors.length > 0 && (
           <Box flexDirection="column">

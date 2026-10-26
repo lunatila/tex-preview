@@ -9,6 +9,7 @@ Whenever Claude edits or writes a `.tex` file, the mod compiles the document and
 - **Engine**: `pdflatex` by default; `xelatex` or `lualatex` with `% !TEX program = ...`, and `xelatex` when the document loads `fontspec`.
 - **Pane buttons**: ◀ ▶ to change page (neighbouring pages are rendered ahead), **Recompilar**, and **Abrir PDF** to open it in your PDF viewer.
 - **Command**: `/tex path/to/file.tex` compiles a file and opens the pane at any time; `/tex` alone recompiles the current one.
+- **Edit in the pane**: **Editar .tex** opens the file Claude last edited, with a picker for the document's other `.tex` files (its folder and the folders just below). Enter saves and recompiles, back on the page of the first line you changed; Shift+Enter breaks the line. If Claude edits the file while you have unsaved changes, the pane says so and keeps yours until you choose. Files over 100,000 characters are left to your own editor.
 
 The page is drawn as an image, in color when it fits the pane's size limit and in grayscale otherwise. It only reacts to Claude's edits: after editing in your own editor, press **Recompilar** or run `/tex`.
 
