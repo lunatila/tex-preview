@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TexPreviewPage, TexPreviewSource, TexPreviewView } from '../types'
+import type { TexPreviewPage, TexPreviewPart, TexPreviewSource, TexPreviewView } from '../types'
 
 const PANE = 'tex-preview'
 // An Svg's source holds at most 131072 characters, the PNG's base64 included.
@@ -19,6 +19,8 @@ const SETTLE_MS = 250
 // The text a tree's Inputs hold together; a longer file is not opened in the
 // editor, since the field would hold only its head and a save would cut it.
 const INPUT_ROOM = 100_000
+// A file longer than this opens a part at a time, well inside INPUT_ROOM.
+const PART_ROOM = 60_000
 // What a quick single pass leaves for latexmk to settle.
 const UNSETTLED = /Rerun to get|There were undefined (references|citations)|Label\(s\) may have changed|No file .*\.(bbl|ind|gls)/
 
@@ -34,6 +36,8 @@ let isRunning = false
 let pendingRoot: string | undefined
 let pendingEdit: Edit | undefined
 let isPending = false
+// Claude's last edit, for the editor to open the part that holds it.
+let lastEdit: Edit | undefined
 // The module's own caches: a reload starts them over, which costs one lookup.
 const roots = new Map<string, string>()
 const pages = new Map<string, TexPreviewPage>()
@@ -329,15 +333,79 @@ async function texFiles($: EngineInterface, root: string): Promise<string[]> {
   return found.sort().slice(0, 60)
 }
 
-async function readSource($: EngineInterface, path: string): Promise<TexPreviewSource> {
-  const raw = await readText(path, $)
-  const text = raw.replace(/\r\n/g, '\n')
+// A heading at the start of a line opens a part: any command named for a part,
+// chapter, section or subsection, a class's own included (\spesection), and
+// the title after it. Subsubsections stay inside their part.
+const HEADING = /^\\([a-zA-Z]*?(?:part|chapter|section))\*?\s*(?:\[[^\]\n]*\])?\s*\{([^\n]*)/gm
 
-  return { path, text, draft: text, isCrlf: raw.includes('\r\n') }
+function headingLabel(command: string, rest: string): string | undefined {
+  if (/subsubsection$/.test(command)) return undefined
+  const title = rest.replace(/\}[^}]*$/, '').replace(/\\[a-zA-Z]+\s*/g, '').trim().slice(0, 60)
+  // A command's definition in the preamble (\spesection{#1}) is no heading.
+  if (title === '' || title.includes('#')) return undefined
+  return /subsection$/.test(command) ? `   ${title}` : title
 }
 
-async function openSource($: EngineInterface, path: string) {
-  const source = await readSource($, path)
+// [start, end) cut at line breaks into pieces of at most PART_ROOM characters.
+function splitLarge(full: string, start: number, end: number, label: string): TexPreviewPart[] {
+  if (end - start <= PART_ROOM) return [{ label, start, end }]
+  const cuts = [start]
+  let at = start
+  while (end - at > PART_ROOM) {
+    const lineStart = full.lastIndexOf('\n', at + PART_ROOM - 1) + 1
+    at = lineStart > at ? lineStart : at + PART_ROOM
+    cuts.push(at)
+  }
+  cuts.push(end)
+
+  return cuts.slice(0, -1).map((from, i) => ({
+    label: `${label} (${i + 1}/${cuts.length - 1})`,
+    start: from,
+    end: cuts[i + 1] ?? end,
+  }))
+}
+
+// The whole file when it fits the editor; else one part per heading, the text
+// before the first heading its own part, each cut further when still large.
+function partsOf(full: string): TexPreviewPart[] {
+  if (full.length <= PART_ROOM) return [{ label: 'arquivo inteiro', start: 0, end: full.length }]
+  const cuts = [{ at: 0, label: 'início (preâmbulo)' }]
+  for (const match of full.matchAll(HEADING)) {
+    const at = match.index ?? 0
+    const label = headingLabel(match[1] ?? '', match[2] ?? '')
+    if (at > 0 && label !== undefined) cuts.push({ at, label })
+  }
+
+  return cuts.flatMap((cut, i) => {
+    const end = cuts[i + 1]?.at ?? full.length
+    return end > cut.at ? splitLarge(full, cut.at, end, cut.label) : []
+  })
+}
+
+const partAt = (parts: TexPreviewPart[], offset: number) =>
+  Math.max(0, parts.findIndex(part => offset >= part.start && offset < part.end))
+
+// The part holding Claude's last edit of the file, else the first.
+function partOfLastEdit(path: string, full: string, parts: TexPreviewPart[]): number {
+  if (lastEdit === undefined || lastEdit.file !== path || lastEdit.newText === '') return 0
+  const at = full.indexOf(lastEdit.newText.replace(/\r\n/g, '\n'))
+
+  return at < 0 ? 0 : partAt(parts, at)
+}
+
+async function readSource($: EngineInterface, path: string, wanted?: number): Promise<TexPreviewSource> {
+  const raw = await readText(path, $)
+  const full = raw.replace(/\r\n/g, '\n')
+  const parts = partsOf(full)
+  const part = Math.min(Math.max(0, wanted ?? partOfLastEdit(path, full, parts)), parts.length - 1)
+  const { start = 0, end = full.length } = parts[part] ?? {}
+  const text = full.slice(start, end)
+
+  return { path, full, parts, part, text, draft: text, isCrlf: raw.includes('\r\n') }
+}
+
+async function openSource($: EngineInterface, path: string, wanted?: number) {
+  const source = await readSource($, path, wanted)
   const { root } = await read($, view)
   const files = root ? await texFiles($, root) : [path]
   await update($, view, (v): TexPreviewView => ({
@@ -348,15 +416,30 @@ async function openSource($: EngineInterface, path: string) {
   }))
 }
 
-// Writes the draft, then shows the PDF at the first line it changed.
+// Puts the draft back in its place in the file, then shows the PDF at the
+// first line it changed. A file changed on disk since it was read is not
+// written over: the editor says so instead.
 async function saveSource($: EngineInterface, draft: string) {
   const { source } = await read($, view)
   if (source === undefined) return
-  await $.fs.write(source.path, source.isCrlf ? draft.replace(/\n/g, '\r\n') : draft)
+  const onDisk = (await readText(source.path, $)).replace(/\r\n/g, '\n')
+  if (onDisk !== source.full) {
+    await update($, view, v => ({ ...v, source: v.source && { ...v.source, isStale: true } }))
+    return
+  }
+  const { start = 0, end = source.full.length } = source.parts[source.part] ?? {}
+  const full = source.full.slice(0, start) + draft + source.full.slice(end)
+  await $.fs.write(source.path, source.isCrlf ? full.replace(/\n/g, '\r\n') : full)
+
+  // The same part, found again by where it starts, now holding the draft.
+  const parts = partsOf(full)
+  const part = partAt(parts, start)
+  const { start: from = 0, end: to = full.length } = parts[part] ?? {}
+  const text = full.slice(from, to)
   await update($, view, (v): TexPreviewView => ({
     ...v,
     mode: 'pdf',
-    source: v.source && { ...v.source, text: draft, draft, isStale: false },
+    source: v.source && { ...v.source, full, parts, part, text, draft: text, isStale: false },
   }))
   pendingEdit = { file: source.path, oldText: source.text, newText: draft }
   schedule($)
@@ -367,7 +450,7 @@ async function onDiskChange($: EngineInterface, path: string) {
   const { source } = await read($, view)
   if (source === undefined || source.path !== path) return
   if (source.draft === source.text) {
-    const fresh = await readSource($, path)
+    const fresh = await readSource($, path, source.part)
     await update($, view, v => ({ ...v, source: fresh }))
   } else {
     await update($, view, v => ({ ...v, source: v.source && { ...v.source, isStale: true } }))
@@ -409,6 +492,7 @@ export const register: Register = on => {
     const oldText = 'old_string' in e && typeof e.old_string === 'string' ? e.old_string : ''
     const newText = 'new_string' in e && typeof e.new_string === 'string' ? e.new_string : ''
     pendingEdit = { file: slash(file), oldText, newText }
+    lastEdit = pendingEdit
     void $.ui.open({ id: PANE, title: `PDF · ${baseOf(roots.get(slash(file)) ?? file)}` })
     schedule($)
     await update($, view, v => ({ ...v, lastFile: slash(file) }))
@@ -431,8 +515,11 @@ export const register: Register = on => {
       const files = v.files ?? []
       const isDirty = source.draft !== source.text
       const isTooLong = source.text.length > INPUT_ROOM
+      // An Input refuses control characters but tab and newline; the pane would then draw nothing.
+      const hasControl = /[\u0000-\u0008\u000b-\u001f\u007f]/.test(source.draft)
       const top = v.root ? `${dirOf(v.root)}/` : ''
-      const rows = Math.max(10, e.props.scroll.bodyRows - 8)
+      const hasParts = source.parts.length > 1
+      const rows = Math.max(10, e.props.scroll.bodyRows - (hasParts ? 11 : 8))
       const setDraft = (draft: string) =>
         update($, view, x => ({ ...x, source: x.source && { ...x.source, draft } }))
 
@@ -440,6 +527,7 @@ export const register: Register = on => {
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" gap={1} flexWrap="wrap">
             <Text bold>{baseOf(source.path)}</Text>
+            {hasParts && <Text>{`· ${source.parts[source.part]?.label.trim() ?? ''}`}</Text>}
             <Text dimColor>
               {isDirty ? 'não salvo · Enter salva, Shift+Enter quebra a linha' : 'sem mudanças'}
             </Text>
@@ -450,7 +538,7 @@ export const register: Register = on => {
               label="Ver PDF"
               onPress={() => void update($, view, (x): TexPreviewView => ({ ...x, mode: 'pdf' }))}
             />
-            {!isTooLong && (
+            {!isTooLong && !hasControl && (
               <Button
                 key="save"
                 variant="primary"
@@ -475,17 +563,37 @@ export const register: Register = on => {
               }}
             />
           )}
+          {Select && hasParts && (
+            <Select
+              key="part"
+              label="Seção"
+              value={String(source.part)}
+              options={source.parts.map((part, i) => ({ value: String(i), label: part.label }))}
+              onSelect={value => {
+                if (isDirty) $.ui.toast('Salve ou descarte as mudanças antes de trocar de seção.')
+                else void openSource($, source.path, Number(value))
+              }}
+            />
+          )}
           {source.isStale && (
             <Box flexDirection="row" gap={1} flexWrap="wrap">
-              <Text color="yellow">O Claude mudou este arquivo enquanto você editava.</Text>
-              <Button key="reload" label="Usar a versão do Claude" onPress={() => void openSource($, source.path)} />
+              <Text color="yellow">
+                O arquivo mudou no disco (pelo Claude ou outro editor) enquanto você editava; nada foi salvo.
+              </Text>
+              <Button
+                key="reload"
+                label="Recarregar (descarta o seu texto)"
+                onPress={() => void openSource($, source.path, source.part)}
+              />
             </Box>
           )}
-          {isTooLong || !Input ? (
+          {isTooLong || hasControl || !Input ? (
             <Text color="yellow">
               {isTooLong
-                ? `Este arquivo tem ${source.text.length} caracteres, mais do que o editor do painel comporta (${INPUT_ROOM}). Edite-o no seu editor.`
-                : 'Esta superfície não tem campo de texto: edite o arquivo no seu editor.'}
+                ? `Este trecho tem ${source.text.length} caracteres numa só linha longa, mais do que o editor do painel comporta (${INPUT_ROOM}). Edite-o no seu editor.`
+                : hasControl
+                  ? 'Este trecho tem um caractere de controle que o campo de texto do painel não aceita. Edite-o no seu editor.'
+                  : 'Esta superfície não tem campo de texto: edite o arquivo no seu editor.'}
             </Text>
           ) : (
             <Input

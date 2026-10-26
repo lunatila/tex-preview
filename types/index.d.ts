@@ -1,9 +1,18 @@
 export type TexPreviewPage = { base64: string; width: number; height: number }
 
+// A stretch of a .tex the editor opens alone: the whole file when it is small,
+// else a section (from its heading to the next), cut further if still large.
+export type TexPreviewPart = { label: string; start: number; end: number }
+
 // A .tex open in the pane's editor.
 export type TexPreviewSource = {
   path: string
-  // The file as last read or saved, its line breaks as `\n`.
+  // The whole file as last read or saved, its line breaks as `\n`.
+  full: string
+  // The file's parts and the one open.
+  parts: TexPreviewPart[]
+  part: number
+  // The open part as last read or saved.
   text: string
   // What the person has typed since.
   draft: string

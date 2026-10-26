@@ -102,3 +102,78 @@ test('editing a chapter compiles its root and shows the page it lands on', async
   expect((await terminal.find({ type: 'Text', text: /PDF em/ }))?.text).toBe('PDF em C:/thesis/main.pdf')
   await terminal.unmount()
 })
+
+// A file past the editor's room opens a section at a time, and a save puts the
+// section back in its place in the whole file.
+test('a long file is edited a section at a time and saved back whole', async ($, on) => {
+  const MAIN = 'C:/paper/main.tex'
+  const filler = `${'a'.repeat(79)}\n`.repeat(500)
+  // A backslash, spelled so no escape in this file can turn it into a control character.
+  const B = String.fromCharCode(92)
+  let disk =
+    `${B}documentclass{spe}\n${B}renewcommand{${B}spesection}[1]{${B}section*{#1}}\n${B}begin{document}\n` +
+    `${B}spesection{Introduction}\n${filler}` +
+    `${B}spesection{Results}\nRESULTS-EDIT here\n${filler}` +
+    `${B}end{document}\n`
+  const written: string[] = []
+  const ran: string[][] = []
+  on('command.register', () => ({ value: { command: 'tex' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'C:/Temp' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.write', (_, e) => {
+    if (!e.path.endsWith('.keep')) {
+      written.push(e.text)
+      disk = e.text
+    }
+    return { value: undefined }
+  })
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: PNG } }
+    if (e.path.endsWith('main.log')) return { value: 'Output written on main.pdf (9 pages, 9 bytes).' }
+    return { value: disk }
+  })
+  on('process.run', (_, e) => {
+    ran.push([...e.argv])
+    const stdout = e.argv[0] === 'synctex' ? 'Page:5\n' : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('tool.call', () => ({ result: {} }))
+
+  await $.session.start({ cwd: 'C:/paper', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Edit', file_path: MAIN, old_string: 'RESULTS', new_string: 'RESULTS-EDIT' })
+  for (let i = 0; i < 100 && !ran.some(argv => argv[0] === 'pdftocairo'); i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // It opens the section holding Claude's last edit, not the whole file.
+  await desktop.press({ key: 'edit' })
+  expect((await desktop.find({ type: 'Text', text: /Results/ }))?.text).toBe('· Results')
+  const opened = (await desktop.find({ key: 'source' }))?.text ?? ''
+  expect(opened.startsWith(`${B}spesection{Results}\nRESULTS-EDIT here\n`)).toBe(true)
+  expect(opened.length).toBeLessThan(60_000)
+
+  // A save puts the section back between the others, the rest untouched.
+  const edited = opened.replace('RESULTS-EDIT here', 'RESULTS rewritten')
+  const before = disk
+  await desktop.input({ key: 'source', text: edited })
+  expect(written.at(-1)).toBe(before.replace('RESULTS-EDIT here', 'RESULTS rewritten'))
+
+  // Another section is picked by its title, and opens alone.
+  await desktop.press({ key: 'edit' })
+  await desktop.select({ key: 'part', value: '1' })
+  const intro = (await desktop.find({ key: 'source' }))?.text ?? ''
+  expect(intro.startsWith(`${B}spesection{Introduction}\n`)).toBe(true)
+
+  // A file changed on disk meanwhile is not written over.
+  disk = disk.replace(`${B}begin{document}`, `${B}begin{document}\n% changed elsewhere`)
+  const writes = written.length
+  await desktop.input({ key: 'source', text: `${intro}more\n` })
+  expect(written).toHaveLength(writes)
+  expect(await desktop.find({ type: 'Text', text: /mudou no disco/ })).toBeDefined()
+  await desktop.unmount()
+})
