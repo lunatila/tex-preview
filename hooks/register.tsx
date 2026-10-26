@@ -19,8 +19,13 @@ const SETTLE_MS = 250
 // The text a tree's Inputs hold together; a longer file is not opened in the
 // editor, since the field would hold only its head and a save would cut it.
 const INPUT_ROOM = 100_000
+// Pages past SyncTeX's that a chapter's start is looked for in.
+const CHAPTER_SPAN = 20
 // How far ◀◀ and ▶▶ jump.
 const JUMP = 10
+// Options a picker holds at most: a thesis's 160 headings in one list stalled
+// the desktop pane, so chapters and the sections of one chapter are two lists.
+const MAX_OPTIONS = 40
 // A file longer than this opens a part at a time, well inside INPUT_ROOM.
 const PART_ROOM = 60_000
 // What a quick single pass leaves for latexmk to settle.
@@ -300,30 +305,94 @@ async function drain($: EngineInterface) {
   }
 }
 
-// Where each heading of the document landed: SyncTeX asked, one heading at a
-// time, from the files of the document's folder; a file the PDF does not
-// draw from answers no page and is left out. Stops when a new compile is due.
+// The .tex files the last compile read, as its log names them: `(./capitulos/
+// 01-introducao.tex`. Empty when the log names none; the folder's are used then.
+async function documentFiles($: EngineInterface, root: string): Promise<string[]> {
+  const top = dirOf(root)
+  const log = await readText(`${top}/${stemOf(root)}.log`, $)
+  const named = new Set<string>()
+  for (const match of log.matchAll(/\(\.\/([^()\s]+\.tex)/g)) if (match[1]) named.add(`${top}/${match[1]}`)
+
+  return [...named]
+}
+
+// Letters and digits alone, lowercased and without accents: how a title and a
+// page's text are compared.
+const bare = (text: string) =>
+  text
+    .normalize('NFD')
+    .replace(/[^A-Za-z0-9]/g, '')
+    .toLowerCase()
+
+// SyncTeX places a chapter's heading on the page where TeX broke the page for
+// it, before the floats still pending, so one or more pages early. The page
+// where it really starts is the first from there whose top holds its title,
+// read with pdftotext from the next CHAPTER_SPAN pages.
+async function chapterPage($: EngineInterface, pdf: string, synced: number, title: string): Promise<number> {
+  const wanted = bare(title).slice(0, 30)
+  if (wanted.length < 4) return synced
+  const ran = await $.process
+    .run(['pdftotext', '-enc', 'UTF-8', '-f', `${synced}`, '-l', `${synced + CHAPTER_SPAN}`, baseOf(pdf), '-'], {
+      cwd: dirOf(pdf),
+      timeoutMs: 60_000,
+    })
+    .catch(() => undefined)
+  if (ran === undefined || ran.exitCode !== 0) return synced
+  const at = ran.stdout.split('\f').findIndex(page => bare(page).slice(0, 120).includes(wanted))
+
+  return at < 0 ? synced : synced + at
+}
+
+// 0 a part or chapter, 1 a section, 2 a subsection, by the command's ending.
+const levelOf = (command: string) => (/subsection$/.test(command) ? 2 : /section$/.test(command) ? 1 : 0)
+
+type Heading = { file: string; line: number; label: string; level: number; order: number }
+
+// Where each heading of the document landed, asked of SyncTeX one at a time
+// (a query reads the whole SyncTeX file: about 140 ms on a 200-page thesis).
+// Only the files the document read are asked, a level at a time from the
+// top. Without a list yet, the pickers fill once each level is placed; with
+// one, it stays until the new one is whole. Stops when a new compile is due.
 async function indexSections($: EngineInterface) {
-  const { root, pdf } = await read($, view)
+  const { root, pdf, sections: before } = await read($, view)
   if (root === undefined || pdf === undefined) return
-  const found: { label: string; page: number; order: number }[] = []
-  for (const file of await texFiles($, root)) {
+  const listed = await documentFiles($, root)
+  const files = listed.length > 0 ? listed : await texFiles($, root)
+
+  const headings: Heading[] = []
+  for (const file of files) {
     const text = (await readText(file, $)).replace(/\r\n/g, '\n')
     let line = 1
     let counted = 0
     for (const match of text.matchAll(HEADING)) {
-      if (isPending) return
       const label = headingLabel(match[1] ?? '', match[2] ?? '')
       if (label === undefined) continue
       const at = match.index ?? 0
       for (let i = counted; i < at; i++) if (text.charCodeAt(i) === 10) line++
       counted = at
-      const page = await pageOf($, pdf, { file, line })
-      if (page !== undefined) found.push({ label, page, order: found.length })
+      const level = levelOf(match[1] ?? '')
+      headings.push({ file, line, label: label.trim(), level, order: headings.length })
     }
   }
-  found.sort((a, b) => a.page - b.page || a.order - b.order)
-  await update($, view, v => ({ ...v, sections: found.map(({ label, page }) => ({ label, page })) }))
+  headings.sort((a, b) => a.level - b.level || a.order - b.order)
+
+  const found: { label: string; page: number; level: number; order: number }[] = []
+  const listOf = () =>
+    [...found]
+      .sort((a, b) => a.page - b.page || a.order - b.order)
+      .map(({ label, page, level }) => ({ label, page, level }))
+  const isFilling = before === undefined || before.length === 0
+  for (const [i, heading] of headings.entries()) {
+    if (isPending) return
+    const synced = await pageOf($, pdf, heading)
+    const page = synced !== undefined && heading.level === 0 ? await chapterPage($, pdf, synced, heading.label) : synced
+    if (page !== undefined) found.push({ label: heading.label, page, level: heading.level, order: heading.order })
+    const isLevelDone = headings[i + 1]?.level !== heading.level
+    if (isFilling && isLevelDone && found.length > 0) {
+      await update($, view, v => ({ ...v, sections: listOf(), sectionsLeft: headings.length - i - 1 }))
+    }
+  }
+  await update($, view, v => ({ ...v, sections: listOf(), sectionsLeft: 0 }))
 }
 
 function schedule($: EngineInterface) {
@@ -654,9 +723,18 @@ export const register: Register = on => {
       `<rect width="100%" height="100%" fill="#fff"/>` +
       `<image href="data:image/png;base64,${v.image.base64}" width="${v.image.width}" height="${v.image.height}"/></svg>`
     const go = (page: number) => void showPage($, page).then(() => prefetch($))
-    const sections = v.sections ?? []
-    // The section the page shown is in: the last that starts on it or before.
-    const current = Math.max(0, sections.findLastIndex(section => section.page <= v.page))
+    // Two pickers: the top level present (chapters, or sections when there are
+    // none), and the headings below it inside the one the page shown is in.
+    const sections = (v.sections ?? []).map((section, i) => ({ ...section, level: section.level ?? 1, i }))
+    const topLevel = Math.min(...sections.map(section => section.level), 2)
+    const tops = sections.filter(section => section.level === topLevel)
+    const topAt = Math.max(0, tops.findLastIndex(section => section.page <= v.page))
+    const inside = sections
+      .slice((tops[topAt]?.i ?? -1) + 1, tops[topAt + 1]?.i ?? sections.length)
+      .slice(0, MAX_OPTIONS)
+    const insideAt = inside.findLastIndex(section => section.page <= v.page)
+    const [topName, insideName] = topLevel === 0 ? ['Capítulo', 'Seção'] : ['Seção', 'Subseção']
+    const finding = v.sectionsLeft ? ` (localizando mais ${v.sectionsLeft}…)` : ''
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -689,14 +767,31 @@ export const register: Register = on => {
             )}
           </Box>
         )}
-        {Select && sections.length > 1 && (
+        {Select && tops.length > 1 && (
           <Select
             key="section"
-            label="Seção"
-            value={String(current)}
-            options={sections.map((section, i) => ({ value: String(i), label: `${section.label} · p. ${section.page}` }))}
+            label={`${topName}${finding}`}
+            value={String(topAt)}
+            options={tops
+              .slice(0, MAX_OPTIONS)
+              .map((section, i) => ({ value: String(i), label: `${section.label} · p. ${section.page}` }))}
             onSelect={value => {
-              const section = sections[Number(value)]
+              const section = tops[Number(value)]
+              if (section) go(section.page)
+            }}
+          />
+        )}
+        {Select && inside.length > 0 && (
+          <Select
+            key="subsection"
+            label={insideName}
+            value={insideAt < 0 ? undefined : String(insideAt)}
+            options={inside.map((section, i) => ({
+              value: String(i),
+              label: `${section.level > topLevel + 1 ? '   ' : ''}${section.label} · p. ${section.page}`,
+            }))}
+            onSelect={value => {
+              const section = inside[Number(value)]
               if (section) go(section.page)
             }}
           />

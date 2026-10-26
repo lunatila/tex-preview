@@ -7,7 +7,7 @@ Whenever Claude edits or writes a `.tex` file, the mod compiles the document and
 - **Finds the main file of a chapter**: a `% !TEX root = main.tex` comment, or else a `.tex` with `\documentclass` in the same folder or the one above that `\input`s or `\include`s the chapter.
 - **Fast first**: one pass of the engine shows the edit right away; when the log asks for another run (references, citations, bibliography), `latexmk` settles it in the background.
 - **Engine**: `pdflatex` by default; `xelatex` or `lualatex` with `% !TEX program = ...`, and `xelatex` when the document loads `fontspec`.
-- **Getting around**: ◀ ▶ a page at a time (**p** and **n** while the pane has the keyboard), ◀◀ ▶▶ ten pages, ⏮ ⏭ the first and last, a **Página** field to type a page number, and a **Seção** picker listing the document's sections with the page each starts on (found with SyncTeX after each compile). The two pages either side of the one shown are rendered ahead.
+- **Getting around**: ◀ ▶ a page at a time (**p** and **n** while the pane has the keyboard), ◀◀ ▶▶ ten pages, ⏮ ⏭ the first and last, a **Página** field to type a page number, and and two pickers with the page each heading starts on: **Capítulo**, and **Seção** for the sections of the chapter shown (a document without chapters gets **Seção** and **Subseção**). The pages are found with SyncTeX after each compile, in the files the compile's log shows the document read; on a long thesis each heading takes about 140 ms, so the pickers fill a level at a time, chapters first. SyncTeX places a chapter on the page where LaTeX broke the page for it, before pending figures, so a chapter's page is then confirmed with `pdftotext`: the first page from there whose top holds its title. The two pages either side of the one shown are rendered ahead.
 - **Pane buttons**: **Recompilar**, and **Abrir PDF** to open it in your PDF viewer.
 - **Command**: `/tex path/to/file.tex` compiles a file and opens the pane at any time; `/tex` alone recompiles the current one.
 - **Edit in the pane**: **Editar .tex** opens the file Claude last edited, with a picker for the document's other `.tex` files (its folder and the folders just below). Enter saves and recompiles, back on the page of the first line you changed; Shift+Enter breaks the line. A file over 60,000 characters opens a section at a time: a picker lists its sections and subsections (any `\...section`, `\...chapter` or `\...part` command at the start of a line, a class's own such as `\spesection` included), it opens the one holding Claude's last edit, and a save puts the section back in its place in the whole file. If the file changes on disk while you edit, by Claude or another editor, nothing is written over: the pane says so and lets you reload.
@@ -18,7 +18,7 @@ The pane shows one page at a time: in testing, the desktop app stopped drawing i
 
 ## Requirements
 
-A TeX distribution with `latexmk`, `pdftocairo` and `synctex` on the `PATH` (a full TeX Live install has all three; on macOS, MacTeX). The pane needs the Claude desktop app or the VS Code extension; the terminal shows the PDF's path instead.
+A TeX distribution with `latexmk`, `pdftocairo`, `pdftotext` and `synctex` on the `PATH` (a full TeX Live install has all four; on macOS, MacTeX). Without `pdftotext`, chapters keep SyncTeX's page. The pane needs the Claude desktop app or the VS Code extension; the terminal shows the PDF's path instead.
 
 ## Install
 

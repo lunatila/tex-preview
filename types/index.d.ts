@@ -32,7 +32,10 @@ export type TexPreviewView = {
   lastFile?: string
   // The document's sections and the page each starts on, found with SyncTeX
   // after a compile, for the pane's picker.
-  sections?: { label: string; page: number }[]
+  // `level`: 0 a part or chapter, 1 a section, 2 a subsection.
+  sections?: { label: string; page: number; level?: number }[]
+  // Headings still to be placed while the picker first fills.
+  sectionsLeft?: number
   root?: string
   pdf?: string
   page: number

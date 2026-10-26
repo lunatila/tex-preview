@@ -187,7 +187,7 @@ test('the pane jumps by section, page number and ten pages', async ($, on) => {
   const MAIN = 'C:/thesis/main.tex'
   const B = String.fromCharCode(92)
   // Headings on lines 3, 5 and 7; SyncTeX places line n on page 4n.
-  const disk = `${B}documentclass{book}\n${B}begin{document}\n${B}chapter{One}\nx\n${B}chapter{Two}\ny\n${B}section{Three}\n${B}end{document}\n`
+  const disk = `${B}documentclass{book}\n${B}begin{document}\n${B}chapter{One}\nx\n${B}chapter{Second Results}\ny\n${B}section{Three}\n${B}end{document}\n`
   const shown: number[] = []
   on('command.register', () => ({ value: { command: 'tex' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -197,16 +197,31 @@ test('the pane jumps by section, page number and ten pages', async ($, on) => {
   on('env.get', () => ({ value: 'C:/Temp' }))
   on('fs.exists', () => ({ value: true }))
   on('fs.write', () => ({ value: undefined }))
-  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  // A draft beside the document, which the log shows it never read.
+  on('fs.list', () => ({
+    value: [
+      { name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false },
+      { name: 'draft.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false },
+    ],
+  }))
   on('fs.read', (_, e) => {
     if (e.as === 'bytes') return { value: { base64: PNG } }
-    if (e.path.endsWith('main.log')) return { value: 'Output written on main.pdf (40 pages, 9 bytes).' }
+    if (e.path.endsWith('main.log')) return { value: '(./main.tex\nOutput written on main.pdf (40 pages, 9 bytes).' }
     return { value: disk }
   })
+  const asked: string[] = []
   on('process.run', (_, e) => {
+    if (e.argv[0] === 'synctex') asked.push(e.argv[e.argv.indexOf('-i') + 1] ?? '')
     const at = e.argv.indexOf('-i')
     const line = at < 0 ? 0 : Number((e.argv[at + 1] ?? '').split(':')[0])
     if (e.argv[0] === 'pdftocairo') shown.push(Number(e.argv[e.argv.indexOf('-f') + 1]))
+    // Chapter Second Results' title is typeset a page after the one SyncTeX gives, past
+    // a page of the previous chapter's floats, as LaTeX does.
+    if (e.argv[0] === 'pdftotext') {
+      const from = Number(e.argv[e.argv.indexOf('-f') + 1])
+      const text = from === 20 ? 'Chapter 1. One 20\nFigure 1.3\f2\nSecond Results\nIt begins.\f' : 'Chapter 1. One\f'
+      return { value: { exitCode: 0, stdout: text, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const stdout = e.argv[0] === 'synctex' ? `Page:${line * 4}\n` : ''
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -238,7 +253,15 @@ test('the pane jumps by section, page number and ten pages', async ($, on) => {
   expect(await page()).toBe('página 40 de 40')
 
   // The sections, in order with their pages; picking one goes there.
+  // Chapter Second Results: SyncTeX says page 20, its title is at the top of page 21.
   await desktop.select({ key: 'section', value: '1' })
-  expect(await page()).toBe('página 20 de 40')
+  expect(await page()).toBe('página 21 de 40')
+  // Inside that chapter, its section; chapters and sections are two pickers.
+  await desktop.select({ key: 'subsection', value: '0' })
+  expect(await page()).toBe('página 28 de 40')
+
+  // Only the file the document read was asked about; chapters before sections.
+  expect(asked.some(query => query.includes('draft.tex'))).toBe(false)
+  expect(asked).toEqual(['3:0:main.tex', '5:0:main.tex', '7:0:main.tex'])
   await desktop.unmount()
 })
