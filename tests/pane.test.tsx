@@ -53,7 +53,8 @@ test('editing a chapter compiles its root and shows the page it lands on', async
     return { value: 'one\ntwo\n\\section{Novo}\nthree\n' }
   })
   on('process.run', (_, e) => {
-    ran.push([...e.argv])
+    // The mod's check that each tool starts (`pdflatex -v`) is not a step.
+    if (e.argv[1] !== '-v' && e.argv[1] !== 'help') ran.push([...e.argv])
     const stdout = e.argv[0] === 'synctex' ? 'SyncTeX result begin\nPage:2\n' : ''
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -141,7 +142,7 @@ test('a long file is edited a section at a time and saved back whole', async ($,
     return { value: disk }
   })
   on('process.run', (_, e) => {
-    ran.push([...e.argv])
+    if (e.argv[1] !== '-v' && e.argv[1] !== 'help') ran.push([...e.argv])
     const stdout = e.argv[0] === 'synctex' ? 'Page:5\n' : ''
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -211,7 +212,7 @@ test('the pane jumps by section, page number and ten pages', async ($, on) => {
   })
   const asked: string[] = []
   on('process.run', (_, e) => {
-    if (e.argv[0] === 'synctex') asked.push(e.argv[e.argv.indexOf('-i') + 1] ?? '')
+    if (e.argv[0] === 'synctex' && e.argv[1] === 'view') asked.push(e.argv[e.argv.indexOf('-i') + 1] ?? '')
     const at = e.argv.indexOf('-i')
     const line = at < 0 ? 0 : Number((e.argv[at + 1] ?? '').split(':')[0])
     if (e.argv[0] === 'pdftocairo') shown.push(Number(e.argv[e.argv.indexOf('-f') + 1]))
@@ -321,5 +322,127 @@ test('the editor opens at the page shown and saves that stretch back', async ($,
   await desktop.press({ key: 'edit' })
   await desktop.press({ key: 'whole' })
   expect((await desktop.find({ key: 'source' }))?.text).toBe(disk)
+  await desktop.unmount()
+})
+
+// On a machine without LaTeX the pane offers TinyTeX; a press installs it,
+// adds what it lacks, and the document compiles.
+test('without LaTeX, one press installs TinyTeX and the document compiles', async ($, on) => {
+  const MAIN = 'C:/thesis/main.tex'
+  const BIN = 'C:/Users/u/AppData/Roaming/TinyTeX/bin/windows'
+  let isInstalled = false
+  // Backslashes spelled by code, as Windows writes paths.
+  const BS = String.fromCharCode(92)
+  const windows = (unixLike: string) => unixLike.split('/').join(BS)
+  let path = windows('C:/Windows/system32')
+  const ran: string[][] = []
+  on('command.register', () => ({ value: { command: 'tex' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: 'C:/thesis' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', (_, e) =>
+    e.name === 'APPDATA'
+      ? { value: windows('C:/Users/u/AppData/Roaming') }
+      : e.name === 'PATH'
+        ? { value: path }
+        : { value: 'C:/Temp' },
+  )
+  on('env.set', (_, e) => {
+    if (e.name === 'PATH' && e.value !== undefined) path = e.value
+    return { value: {} }
+  })
+  on('fs.exists', (_, e) => ({ value: e.path.split(BS).join('/') === `${BIN}/tlmgr.bat` ? isInstalled : true }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: PNG } }
+    if (e.path.endsWith('main.log')) return { value: '(./main.tex\nOutput written on main.pdf (2 pages, 9 bytes).' }
+    return { value: `${BS}documentclass{article}\n` }
+  })
+  on('process.run', (_, e) => {
+    const tool = e.argv[0] ?? ''
+    // Before the install no TeX program starts; curl and cmd always do.
+    if (!isInstalled && tool !== 'cmd' && tool !== 'curl.exe') return { deny: `${tool}: not found` }
+    if (tool === 'cmd') isInstalled = true
+    if (e.argv[1] !== '-v' && e.argv[1] !== 'help') ran.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('command.run', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'C:/thesis', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'tex', args: MAIN, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (let i = 0; i < 100 && (await desktop.find({ key: 'install-tex' })) === undefined; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  expect(await desktop.find({ type: 'Text', text: /não foi encontrado/ })).toBeDefined()
+  expect(ran).toHaveLength(0)
+
+  await desktop.press({ key: 'install-tex' })
+  for (let i = 0; i < 100 && !ran.some(argv => argv[0] === 'pdflatex'); i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  // The official installer fetched and run, then what TinyTeX lacks, then the document.
+  expect(ran[0]).toEqual(['curl.exe', '-fsSLO', 'https://tinytex.yihui.org/install-bin-windows.bat'])
+  expect(ran[1]).toEqual(['cmd', '/c', 'install-bin-windows.bat'])
+  expect(ran[2]).toEqual(['tlmgr', 'install', 'latexmk', 'synctex', 'wintools.windows'])
+  expect(ran.some(argv => argv[0] === 'pdflatex')).toBe(true)
+  expect(path.startsWith(`${windows(BIN)};`)).toBe(true)
+  expect(await desktop.find({ key: 'install-tex' })).toBeUndefined()
+  await desktop.unmount()
+})
+
+// A class or package the machine lacks: a press finds its package with tlmgr,
+// installs it, and the document compiles again.
+test('a missing .cls is installed with tlmgr on a press', async ($, on) => {
+  const MAIN = 'C:/thesis/main.tex'
+  let isInstalled = false
+  const ran: string[][] = []
+  on('command.register', () => ({ value: { command: 'tex' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: 'C:/thesis' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'C:/Temp' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: PNG } }
+    if (e.path.endsWith('main.log')) {
+      return {
+        value: isInstalled
+          ? '(./main.tex\nOutput written on main.pdf (2 pages, 9 bytes).'
+          : "(./main.tex\n! LaTeX Error: File `abntex2.cls' not found.\n",
+      }
+    }
+    return { value: `${String.fromCharCode(92)}documentclass{abntex2}\n` }
+  })
+  on('process.run', (_, e) => {
+    if (e.argv[1] !== '-v' && e.argv[1] !== 'help') ran.push([...e.argv])
+    if (e.argv[0] === 'tlmgr' && e.argv[1] === 'install') isInstalled = true
+    const stdout = e.argv[1] === 'search' ? 'abntex2:\n\ttexmf-dist/tex/latex/abntex2/abntex2.cls\n' : ''
+    const exitCode = e.argv[0] === 'pdflatex' && !isInstalled ? 1 : 0
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('command.run', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'C:/thesis', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'tex', args: MAIN, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (let i = 0; i < 100 && (await desktop.find({ key: 'install-package' })) === undefined; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  expect(await desktop.find({ type: 'Text', text: /Falta abntex2.cls/ })).toBeDefined()
+
+  await desktop.press({ key: 'install-package' })
+  for (let i = 0; i < 100 && ran.filter(argv => argv[0] === 'pdflatex').length < 2; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  expect(ran).toContainEqual(['tlmgr', 'search', '--global', '--file', '/abntex2.cls'])
+  expect(ran).toContainEqual(['tlmgr', 'install', 'abntex2'])
+  expect(ran.filter(argv => argv[0] === 'pdflatex')).toHaveLength(2)
+  expect(await desktop.find({ key: 'install-package' })).toBeUndefined()
   await desktop.unmount()
 })

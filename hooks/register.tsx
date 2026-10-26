@@ -241,6 +241,156 @@ async function run($: EngineInterface, argv: string[], cwd: string): Promise<Pas
     .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
 }
 
+// The programs the mod runs. Without the first three nothing compiles or
+// shows; without the last two, pages are not found from the source.
+const TOOLS = ['pdflatex', 'latexmk', 'pdftocairo', 'synctex', 'pdftotext']
+// TinyTeX's official installers, run only on the person's press.
+const TINYTEX_WINDOWS = 'https://tinytex.yihui.org/install-bin-windows.bat'
+const TINYTEX_UNIX = 'https://tinytex.yihui.org/install-bin-unix.sh'
+// What TinyTeX lacks of the tools, per system (Windows' pdftocairo and
+// pdftotext come in wintools; elsewhere they are poppler's, not TeX Live's).
+const EXTRAS_WINDOWS = ['latexmk', 'synctex', 'wintools.windows']
+const EXTRAS_UNIX = ['latexmk', 'synctex']
+
+let checkedTools: string[] | undefined
+
+const isWindowsPath = (path: string) => /^[A-Za-z]:\//.test(slash(path))
+
+// A tool is there when it starts; its exit status says nothing here.
+const canRun = ($: EngineInterface, tool: string) =>
+  $.process.run([tool, tool === 'synctex' ? 'help' : '-v'], { timeoutMs: 20_000 }).then(
+    () => true,
+    () => false,
+  )
+
+// Where TinyTeX's programs are, when installed in its default place.
+async function tinyTexBins($: EngineInterface, isWindows: boolean): Promise<string[]> {
+  if (isWindows) {
+    const places = [await $.env.get('APPDATA'), await $.env.get('ProgramData')]
+    return places.filter((place): place is string => !!place).map(place => `${slash(place)}/TinyTeX/bin/windows`)
+  }
+  const home = await $.env.get('HOME')
+  if (!home) return []
+  return ['universal-darwin', 'x86_64-darwin', 'x86_64-linux', 'aarch64-linux'].flatMap(arch => [
+    `${home}/Library/TinyTeX/bin/${arch}`,
+    `${home}/.TinyTeX/bin/${arch}`,
+  ])
+}
+
+// Puts an installed TinyTeX ahead on the PATH this session's programs get:
+// the installer adds it for new sessions only.
+async function useTinyTex($: EngineInterface, isWindows: boolean): Promise<boolean> {
+  for (const bin of await tinyTexBins($, isWindows)) {
+    if (!(await $.fs.exists(`${bin}/${isWindows ? 'tlmgr.bat' : 'tlmgr'}`))) continue
+    const path = (await $.env.get('PATH')) ?? ''
+    const native = isWindows ? bin.replace(/\//g, '\\') : bin
+    if (!path.split(isWindows ? ';' : ':').includes(native)) {
+      await $.env.set('PATH', `${native}${isWindows ? ';' : ':'}${path}`)
+    }
+    return true
+  }
+  return false
+}
+
+// The tools this machine lacks, after looking for TinyTeX too; once per
+// session, again after an install.
+async function missingTools($: EngineInterface, root: string): Promise<string[]> {
+  if (checkedTools !== undefined) return checkedTools
+  const check = async () => {
+    const missing: string[] = []
+    for (const tool of TOOLS) if (!(await canRun($, tool))) missing.push(tool)
+    return missing
+  }
+  let missing = await check()
+  if (missing.length > 0 && (await useTinyTex($, isWindowsPath(root)))) missing = await check()
+  checkedTools = missing
+
+  return missing
+}
+
+// TinyTeX, downloaded and installed by its official script, then the tools
+// it lacks; then the document compiles again. Only on the person's press.
+async function installTex($: EngineInterface) {
+  const { root } = await read($, view)
+  if (root === undefined) return
+  const isWindows = isWindowsPath(root)
+  const note = (installNote: string) =>
+    update($, view, (v): TexPreviewView => ({ ...v, status: 'installing', installNote }))
+
+  await note('baixando e instalando o TinyTeX… (alguns minutos)')
+  // On Windows the script is fetched, then run, in the temporary folder: two
+  // plain commands, with no quoting for cmd to misread.
+  const temp = isWindows ? slash((await $.env.get('TEMP')) ?? dirOf(root)) : dirOf(root)
+  const fetched = isWindows ? await run($, ['curl.exe', '-fsSLO', TINYTEX_WINDOWS], temp) : undefined
+  const installed =
+    fetched !== undefined && fetched.exitCode !== 0
+      ? fetched
+      : await run($, isWindows ? ['cmd', '/c', 'install-bin-windows.bat'] : ['sh', '-c', `curl -fsSL ${TINYTEX_UNIX} | sh`], temp)
+  if (installed.exitCode !== 0 || !(await useTinyTex($, isWindows))) {
+    const why = (installed.stderr || installed.stdout).trim().split(/\r?\n/).slice(-3).join(' ')
+    await update($, view, (v): TexPreviewView => ({
+      ...v,
+      status: 'error',
+      installNote: `A instalação do TinyTeX falhou: ${why || 'sem mensagem'}`,
+    }))
+    return
+  }
+
+  await note('instalando latexmk, synctex e as ferramentas de PDF…')
+  await run($, ['tlmgr', 'install', ...(isWindows ? EXTRAS_WINDOWS : EXTRAS_UNIX)], dirOf(root))
+  checkedTools = undefined
+  const missing = await missingTools($, root)
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    status: 'idle',
+    missingTools: missing,
+    installNote: missing.length > 0 ? undefined : 'TinyTeX instalado.',
+  }))
+  if (missing.length > 0) return
+  pendingRoot = root
+  schedule($)
+}
+
+// The package holding `file` (tlmgr's search over the package catalogue),
+// installed with tlmgr; then the document compiles again.
+async function installPackage($: EngineInterface, file: string) {
+  const { root } = await read($, view)
+  if (root === undefined) return
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    status: 'installing',
+    installNote: `procurando o pacote que tem ${file}…`,
+  }))
+  const found = await run($, ['tlmgr', 'search', '--global', '--file', `/${file}`], dirOf(root))
+  const name = /^([A-Za-z0-9][\w.-]*):\s*$/m.exec(found.stdout)?.[1]
+  if (name === undefined) {
+    await update($, view, (v): TexPreviewView => ({
+      ...v,
+      status: 'error',
+      installNote: `Nenhum pacote do TeX Live tem ${file}.`,
+    }))
+    return
+  }
+  await update($, view, (v): TexPreviewView => ({ ...v, installNote: `instalando o pacote ${name}…` }))
+  const installed = await run($, ['tlmgr', 'install', name], dirOf(root))
+  if (installed.exitCode !== 0) {
+    const why = (installed.stderr || installed.stdout).trim().split(/\r?\n/).slice(-3).join(' ')
+    await update($, view, (v): TexPreviewView => ({
+      ...v,
+      status: 'error',
+      installNote: `tlmgr não instalou ${name}: ${why}`,
+    }))
+    return
+  }
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    missingFile: undefined,
+    installNote: `Pacote ${name} instalado.`,
+  }))
+  pendingRoot = root
+  schedule($)
+}
+
 // Reads what a pass left and shows it; answers whether the log asks for more.
 async function settle($: EngineInterface, root: string, ran: Pass, page?: number): Promise<boolean> {
   const dir = dirOf(root)
@@ -254,6 +404,8 @@ async function settle($: EngineInterface, root: string, ran: Pass, page?: number
   const hasPdf = await $.fs.exists(pdf)
   for (const key of [...pages.keys()]) if (key.startsWith(`${pdf}#`)) pages.delete(key)
   const status: TexPreviewView['status'] = ran.exitCode === 0 ? 'ok' : 'error'
+  // A class or package the machine does not have: tlmgr can fetch it.
+  const missingFile = /! LaTeX Error: File `([^']+)' not found/.exec(log)?.[1]
   await update($, view, v => ({
     ...v,
     root,
@@ -261,6 +413,7 @@ async function settle($: EngineInterface, root: string, ran: Pass, page?: number
     pages: count || v.pages,
     status,
     errors,
+    missingFile,
     updatedAt: Date.now(),
   }))
   if (hasPdf) await showPage($, page ?? (await read($, view)).page)
@@ -270,6 +423,17 @@ async function settle($: EngineInterface, root: string, ran: Pass, page?: number
 
 async function compile($: EngineInterface, root: string, edit: Edit | undefined) {
   await update($, view, (v): TexPreviewView => ({ ...v, root, status: 'compiling', isRefining: false }))
+  // Without LaTeX, or what draws a page, there is nothing to run: the pane
+  // offers to install it instead.
+  const missing = await missingTools($, root)
+  const isBlocked = missing.some(tool => tool === 'pdflatex' || tool === 'latexmk' || tool === 'pdftocairo')
+  await update($, view, (v): TexPreviewView => ({
+    ...v,
+    missingTools: missing,
+    status: isBlocked ? 'error' : v.status,
+    errors: isBlocked ? [] : v.errors,
+  }))
+  if (isBlocked) return
   const dir = dirOf(root)
   const program = programOf(await readText(root, $))
   const flags = ['-interaction=nonstopmode', '-file-line-error', '-synctex=1']
@@ -397,6 +561,12 @@ async function indexSections($: EngineInterface) {
     }
   }
   await update($, view, v => ({ ...v, sections: listOf(), sectionsLeft: 0 }))
+}
+
+// Long work a press starts runs from a timer, so the end of the press's own
+// dispatch does not cut it short.
+function later($: EngineInterface, work: () => Promise<unknown>) {
+  $.clock.after(0, () => void work())
 }
 
 function schedule($: EngineInterface) {
@@ -811,6 +981,8 @@ export const register: Register = on => {
 
     const label =
       v.status === 'compiling' ? 'compilando…'
+      : v.status === 'installing' ? `instalando: ${v.installNote ?? ''}`
+      : v.status === 'error' && (v.missingTools ?? []).length > 0 && v.errors.length === 0 ? 'faltam programas'
       : v.status === 'error' ? 'erros na compilação'
       : v.status === 'ok' ? `página ${v.page} de ${v.pages || '?'}${v.isRefining ? ' · atualizando referências…' : ''}`
       : 'aguardando um .tex'
@@ -820,6 +992,13 @@ export const register: Register = on => {
       `<rect width="100%" height="100%" fill="#fff"/>` +
       `<image href="data:image/png;base64,${v.image.base64}" width="${v.image.width}" height="${v.image.height}"/></svg>`
     const go = (page: number) => void showPage($, page).then(() => prefetch($))
+    // TinyTeX brings every tool on Windows; elsewhere the PDF tools are poppler's.
+    const missing = v.missingTools ?? []
+    const isWindows = v.root !== undefined && isWindowsPath(v.root)
+    const lacksTex = missing.some(tool => tool === 'pdflatex' || tool === 'latexmk' || tool === 'synctex')
+    const lacksPdfTools = missing.some(tool => tool.startsWith('pdfto'))
+    const needsTex = lacksTex || (isWindows && lacksPdfTools)
+    const needsPoppler = !isWindows && lacksPdfTools
     // Two pickers: the top level present (chapters, or sections when there are
     // none), and the headings below it inside the one the page shown is in.
     const sections = (v.sections ?? []).map((section, i) => ({ ...section, level: section.level ?? 1, i }))
@@ -908,6 +1087,41 @@ export const register: Register = on => {
             <Button key="edit" label="Editar esta página" onPress={() => void openAtPage($)} />
           )}
         </Box>
+        {needsTex && v.status !== 'installing' && (
+          <Box flexDirection="column" gap={1}>
+            <Text color="yellow">
+              {`O LaTeX não foi encontrado neste computador (faltam: ${missing.join(', ')}). ` +
+                'O mod pode instalar o TinyTeX, uma versão enxuta do TeX Live: ~200 MB, alguns minutos, ' +
+                'na sua pasta de usuário, sem pedir permissão de administrador.'}
+            </Text>
+            <Button
+              key="install-tex"
+              variant="primary"
+              label="Instalar LaTeX (TinyTeX)"
+              onPress={() => later($, () => installTex($))}
+            />
+          </Box>
+        )}
+        {needsPoppler && (
+          <Text color="yellow">
+            {`Faltam ${missing.filter(tool => tool.startsWith('pdfto')).join(' e ')}, que vêm do poppler, não do TeX Live. ` +
+              'No Mac: brew install poppler. No Linux: sudo apt install poppler-utils (ou o equivalente da sua distribuição).'}
+          </Text>
+        )}
+        {v.missingFile && v.status !== 'installing' && (
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            <Text color="yellow">{`Falta ${v.missingFile} neste computador.`}</Text>
+            <Button
+              key="install-package"
+              label={`Instalar o pacote de ${v.missingFile}`}
+              onPress={() => {
+                const file = v.missingFile
+                if (file) later($, () => installPackage($, file))
+              }}
+            />
+          </Box>
+        )}
+        {v.installNote && v.status !== 'installing' && <Text dimColor>{v.installNote}</Text>}
         {v.errors.length > 0 && (
           <Box flexDirection="column">
             {v.errors.map(line => (

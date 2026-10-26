@@ -20,6 +20,8 @@ The pane shows one page at a time: in testing, the desktop app stopped drawing i
 
 A TeX distribution with `latexmk`, `pdftocairo`, `pdftotext` and `synctex` on the `PATH` (a full TeX Live install has all four; on macOS, MacTeX). Without `pdftotext`, chapters keep SyncTeX's page. The pane needs the Claude desktop app or the VS Code extension; the terminal shows the PDF's path instead.
 
+**No LaTeX on the machine?** The pane says so and offers **Instalar LaTeX (TinyTeX)**: one press downloads [TinyTeX](https://yihui.org/tinytex/), a small TeX Live (about 200 MB, a few minutes), with its official installer into your user folder, no administrator needed, then adds `latexmk` and `synctex` (and, on Windows, `pdftocairo` and `pdftotext`). On macOS and Linux those two come from poppler instead: `brew install poppler`, or `sudo apt install poppler-utils`. When a compile then stops on a class or package the machine lacks (``File `abntex2.cls' not found``), the pane offers to install the package holding it with `tlmgr`. Nothing is downloaded without a press. The Windows flow is covered by tests; the macOS and Linux installs have not been tried.
+
 ## Install
 
 At the prompt of a terminal session:

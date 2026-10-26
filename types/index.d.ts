@@ -45,7 +45,15 @@ export type TexPreviewView = {
   pdf?: string
   page: number
   pages: number
-  status: 'idle' | 'compiling' | 'ok' | 'error'
+  status: 'idle' | 'compiling' | 'ok' | 'error' | 'installing'
+  // The programs the mod runs that this machine lacks: the pane offers to
+  // install TinyTeX, or says how to get what TeX Live does not ship.
+  missingTools?: string[]
+  // A file the last compile could not find (`xyz.sty`), which the pane
+  // offers to install with tlmgr.
+  missingFile?: string
+  // What an install under way is doing, or how the last one failed.
+  installNote?: string
   // latexmk is settling references and the bibliography after the quick pass.
   isRefining?: boolean
   errors: string[]
