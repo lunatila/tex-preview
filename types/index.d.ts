@@ -30,6 +30,9 @@ export type TexPreviewView = {
   files?: string[]
   // The .tex Claude last edited: the one the editor opens first.
   lastFile?: string
+  // The document's sections and the page each starts on, found with SyncTeX
+  // after a compile, for the pane's picker.
+  sections?: { label: string; page: number }[]
   root?: string
   pdf?: string
   page: number

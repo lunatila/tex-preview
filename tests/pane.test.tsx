@@ -69,9 +69,13 @@ test('editing a chapter compiles its root and shows the page it lands on', async
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   expect(opened).toContain('tex-preview')
-  // A quick pass first, then latexmk, as the log asks for a rerun.
+  // A quick pass first, then latexmk, as the log asks for a rerun, then the
+  // one heading of the document placed for the section picker.
+  for (let i = 0; i < 100 && ran.filter(argv => argv[0] === 'synctex').length < 2; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
   const tools = ran.map(argv => argv[0]).filter(tool => tool !== 'pdftocairo')
-  expect(tools).toEqual(['pdflatex', 'synctex', 'latexmk'])
+  expect(tools).toEqual(['pdflatex', 'synctex', 'latexmk', 'synctex'])
   expect(ran.find(argv => argv[0] === 'pdflatex')).toContain('main.tex')
   expect(ran.find(argv => argv[0] === 'synctex')).toContain('3:0:cap1.tex')
   // Page 2 rendered after each pass, then pages 3 and 1 ahead of a press.
@@ -175,5 +179,66 @@ test('a long file is edited a section at a time and saved back whole', async ($,
   await desktop.input({ key: 'source', text: `${intro}more\n` })
   expect(written).toHaveLength(writes)
   expect(await desktop.find({ type: 'Text', text: /mudou no disco/ })).toBeDefined()
+  await desktop.unmount()
+})
+
+// A long document is crossed by section, by page number and by ten pages.
+test('the pane jumps by section, page number and ten pages', async ($, on) => {
+  const MAIN = 'C:/thesis/main.tex'
+  const B = String.fromCharCode(92)
+  // Headings on lines 3, 5 and 7; SyncTeX places line n on page 4n.
+  const disk = `${B}documentclass{book}\n${B}begin{document}\n${B}chapter{One}\nx\n${B}chapter{Two}\ny\n${B}section{Three}\n${B}end{document}\n`
+  const shown: number[] = []
+  on('command.register', () => ({ value: { command: 'tex' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: 'C:/thesis' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'C:/Temp' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: PNG } }
+    if (e.path.endsWith('main.log')) return { value: 'Output written on main.pdf (40 pages, 9 bytes).' }
+    return { value: disk }
+  })
+  on('process.run', (_, e) => {
+    const at = e.argv.indexOf('-i')
+    const line = at < 0 ? 0 : Number((e.argv[at + 1] ?? '').split(':')[0])
+    if (e.argv[0] === 'pdftocairo') shown.push(Number(e.argv[e.argv.indexOf('-f') + 1]))
+    const stdout = e.argv[0] === 'synctex' ? `Page:${line * 4}\n` : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('command.run', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'C:/thesis', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'tex', args: MAIN, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const page = async () => (await desktop.find({ type: 'Text', text: /página/ }))?.text
+  for (let i = 0; i < 100 && (await desktop.find({ key: 'section' })) === undefined; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  expect(await page()).toBe('página 1 de 40')
+
+  // Ten ahead, then the last page and the first.
+  await desktop.press({ key: 'ahead10' })
+  expect(await page()).toBe('página 11 de 40')
+  await desktop.press({ key: 'last' })
+  expect(await page()).toBe('página 40 de 40')
+  await desktop.press({ key: 'back10' })
+  expect(await page()).toBe('página 30 de 40')
+  await desktop.press({ key: 'first' })
+  expect(await page()).toBe('página 1 de 40')
+
+  // A page typed in, then one out of range lands on the last.
+  await desktop.input({ key: 'goto', text: '25' })
+  expect(await page()).toBe('página 25 de 40')
+  await desktop.input({ key: 'goto', text: '999' })
+  expect(await page()).toBe('página 40 de 40')
+
+  // The sections, in order with their pages; picking one goes there.
+  await desktop.select({ key: 'section', value: '1' })
+  expect(await page()).toBe('página 20 de 40')
   await desktop.unmount()
 })

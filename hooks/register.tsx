@@ -19,6 +19,8 @@ const SETTLE_MS = 250
 // The text a tree's Inputs hold together; a longer file is not opened in the
 // editor, since the field would hold only its head and a save would cut it.
 const INPUT_ROOM = 100_000
+// How far ◀◀ and ▶▶ jump.
+const JUMP = 10
 // A file longer than this opens a part at a time, well inside INPUT_ROOM.
 const PART_ROOM = 60_000
 // What a quick single pass leaves for latexmk to settle.
@@ -212,11 +214,11 @@ async function showPage($: EngineInterface, page: number) {
   await update($, view, v => ({ ...v, page: target, image: image ?? v.image }))
 }
 
-// The pages either side of the one shown, so paging through is instant.
+// The two pages either side of the one shown, so paging through is instant.
 async function prefetch($: EngineInterface) {
   const { pdf, page, pages: count } = await read($, view)
   if (pdf === undefined) return
-  for (const near of [page + 1, page - 1]) {
+  for (const near of [page + 1, page - 1, page + 2, page - 2]) {
     if (isPending) return
     if (near >= 1 && near <= count) await renderPage($, pdf, near).catch(() => undefined)
   }
@@ -292,9 +294,36 @@ async function drain($: EngineInterface) {
       if (root !== undefined) await compile($, root, edit)
     }
     await prefetch($)
+    if (!isPending) await indexSections($)
   } finally {
     isRunning = false
   }
+}
+
+// Where each heading of the document landed: SyncTeX asked, one heading at a
+// time, from the files of the document's folder; a file the PDF does not
+// draw from answers no page and is left out. Stops when a new compile is due.
+async function indexSections($: EngineInterface) {
+  const { root, pdf } = await read($, view)
+  if (root === undefined || pdf === undefined) return
+  const found: { label: string; page: number; order: number }[] = []
+  for (const file of await texFiles($, root)) {
+    const text = (await readText(file, $)).replace(/\r\n/g, '\n')
+    let line = 1
+    let counted = 0
+    for (const match of text.matchAll(HEADING)) {
+      if (isPending) return
+      const label = headingLabel(match[1] ?? '', match[2] ?? '')
+      if (label === undefined) continue
+      const at = match.index ?? 0
+      for (let i = counted; i < at; i++) if (text.charCodeAt(i) === 10) line++
+      counted = at
+      const page = await pageOf($, pdf, { file, line })
+      if (page !== undefined) found.push({ label, page, order: found.length })
+    }
+  }
+  found.sort((a, b) => a.page - b.page || a.order - b.order)
+  await update($, view, v => ({ ...v, sections: found.map(({ label, page }) => ({ label, page })) }))
 }
 
 function schedule($: EngineInterface) {
@@ -340,7 +369,12 @@ const HEADING = /^\\([a-zA-Z]*?(?:part|chapter|section))\*?\s*(?:\[[^\]\n]*\])?\
 
 function headingLabel(command: string, rest: string): string | undefined {
   if (/subsubsection$/.test(command)) return undefined
-  const title = rest.replace(/\}[^}]*$/, '').replace(/\\[a-zA-Z]+\s*/g, '').trim().slice(0, 60)
+  const title = rest
+    .replace(/\}[^}]*$/, '')
+    .replace(/\\[a-zA-Z]+\s*/g, '')
+    .replace(/~/g, ' ')
+    .trim()
+    .slice(0, 60)
   // A command's definition in the preamble (\spesection{#1}) is no heading.
   if (title === '' || title.includes('#')) return undefined
   return /subsection$/.test(command) ? `   ${title}` : title
@@ -619,6 +653,10 @@ export const register: Register = on => {
       `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${v.image.width} ${v.image.height}" width="${v.image.width}" height="${v.image.height}">` +
       `<rect width="100%" height="100%" fill="#fff"/>` +
       `<image href="data:image/png;base64,${v.image.base64}" width="${v.image.width}" height="${v.image.height}"/></svg>`
+    const go = (page: number) => void showPage($, page).then(() => prefetch($))
+    const sections = v.sections ?? []
+    // The section the page shown is in: the last that starts on it or before.
+    const current = Math.max(0, sections.findLastIndex(section => section.page <= v.page))
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -628,9 +666,42 @@ export const register: Register = on => {
             {label}
           </Text>
         </Box>
+        {v.pages > 1 && (
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            <Button key="first" label="⏮" onPress={() => go(1)} />
+            <Button key="back10" label="◀◀ 10" onPress={() => go(v.page - JUMP)} />
+            <Button key="prev" label="◀" hotkey="p" onPress={() => go(v.page - 1)} />
+            <Button key="next" label="▶" hotkey="n" onPress={() => go(v.page + 1)} />
+            <Button key="ahead10" label="10 ▶▶" onPress={() => go(v.page + JUMP)} />
+            <Button key="last" label="⏭" onPress={() => go(v.pages)} />
+            {Input && (
+              <Input
+                key="goto"
+                label="Página"
+                placeholder={`1–${v.pages}`}
+                value=""
+                submitLabel="ir"
+                onSubmit={text => {
+                  const page = Number.parseInt(text, 10)
+                  if (Number.isFinite(page)) go(page)
+                }}
+              />
+            )}
+          </Box>
+        )}
+        {Select && sections.length > 1 && (
+          <Select
+            key="section"
+            label="Seção"
+            value={String(current)}
+            options={sections.map((section, i) => ({ value: String(i), label: `${section.label} · p. ${section.page}` }))}
+            onSelect={value => {
+              const section = sections[Number(value)]
+              if (section) go(section.page)
+            }}
+          />
+        )}
         <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="prev" label="◀" onPress={() => void showPage($, v.page - 1).then(() => prefetch($))} />
-          <Button key="next" label="▶" onPress={() => void showPage($, v.page + 1).then(() => prefetch($))} />
           <Button
             key="build"
             label="Recompilar"
