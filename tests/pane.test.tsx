@@ -265,3 +265,61 @@ test('the pane jumps by section, page number and ten pages', async ($, on) => {
   expect(asked).toEqual(['3:0:main.tex', '5:0:main.tex', '7:0:main.tex'])
   await desktop.unmount()
 })
+
+// "Editar esta página" opens the editor where the page shown begins: the
+// paragraph SyncTeX's inverse search names, saved back in its place.
+test('the editor opens at the page shown and saves that stretch back', async ($, on) => {
+  const MAIN = 'C:/thesis/main.tex'
+  const B = String.fromCharCode(92)
+  let disk = `${B}documentclass{article}\n${B}begin{document}\nIntro text.\n\nPage two starts here\nand goes on.\n\nMore text.\n${B}end{document}\n`
+  const written: string[] = []
+  on('command.register', () => ({ value: { command: 'tex' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: 'C:/thesis' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'C:/Temp' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: 'main.tex', kind: 'file', size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.write', (_, e) => {
+    if (!e.path.endsWith('.keep')) {
+      written.push(e.text)
+      disk = e.text
+    }
+    return { value: undefined }
+  })
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: PNG } }
+    if (e.path.endsWith('main.log')) return { value: '(./main.tex\nOutput written on main.pdf (3 pages, 9 bytes).' }
+    return { value: disk }
+  })
+  on('process.run', (_, e) => {
+    // Every point of page 2 answers line 6, the end of the paragraph that starts on line 5.
+    const stdout = e.argv[0] === 'synctex' && e.argv[1] === 'edit' ? 'Input:C:/thesis/./main.tex\nLine:6\n' : ''
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('command.run', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'C:/thesis', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'tex', args: MAIN, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (let i = 0; i < 100 && (await desktop.find({ type: 'Text', text: /página 1 de 3/ })) === undefined; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  await desktop.press({ key: 'next' })
+
+  await desktop.press({ key: 'edit' })
+  expect((await desktop.find({ type: 'Text', text: /linha/ }))?.text).toBe('· a partir da linha 5')
+  const opened = (await desktop.find({ key: 'source' }))?.text ?? ''
+  expect(opened.startsWith('Page two starts here\nand goes on.\n')).toBe(true)
+
+  const before = disk
+  await desktop.input({ key: 'source', text: opened.replace('Page two starts here', 'Page two, rewritten') })
+  expect(written.at(-1)).toBe(before.replace('Page two starts here', 'Page two, rewritten'))
+
+  // From the middle of the file, the whole of it is a press away.
+  await desktop.press({ key: 'edit' })
+  await desktop.press({ key: 'whole' })
+  expect((await desktop.find({ key: 'source' }))?.text).toBe(disk)
+  await desktop.unmount()
+})

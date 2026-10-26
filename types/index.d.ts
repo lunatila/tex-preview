@@ -9,10 +9,15 @@ export type TexPreviewSource = {
   path: string
   // The whole file as last read or saved, its line breaks as `\n`.
   full: string
-  // The file's parts and the one open.
+  // The file's parts, and the one holding the stretch open.
   parts: TexPreviewPart[]
   part: number
-  // The open part as last read or saved.
+  // The stretch open, [start, end) of `full`: a part, or from the line the
+  // page shown starts on to the end of its part; and how the editor names it.
+  start: number
+  end: number
+  label: string
+  // The stretch open as last read or saved.
   text: string
   // What the person has typed since.
   draft: string

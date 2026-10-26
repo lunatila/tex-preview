@@ -19,6 +19,10 @@ const SETTLE_MS = 250
 // The text a tree's Inputs hold together; a longer file is not opened in the
 // editor, since the field would hold only its head and a save would cut it.
 const INPUT_ROOM = 100_000
+// Points asked down a page to find where it begins in the source, in big
+// points from its top left: the left margin, from below a running head on.
+const PAGE_PROBE_X = 90
+const PAGE_PROBES = [100, 160, 240, 320, 400, 480, 560, 640]
 // Pages past SyncTeX's that a chapter's start is looked for in.
 const CHAPTER_SPAN = 20
 // How far ◀◀ and ▶▶ jump.
@@ -496,19 +500,43 @@ function partOfLastEdit(path: string, full: string, parts: TexPreviewPart[]): nu
   return at < 0 ? 0 : partAt(parts, at)
 }
 
-async function readSource($: EngineInterface, path: string, wanted?: number): Promise<TexPreviewSource> {
+// The offset where line `line` (1-based) of `text` starts.
+function offsetOfLine(text: string, line: number): number {
+  let at = 0
+  for (let i = 1; i < line; i++) {
+    const next = text.indexOf('\n', at)
+    if (next < 0) return text.length
+    at = next + 1
+  }
+
+  return at
+}
+
+const lineOfOffset = (text: string, offset: number) => text.slice(0, offset).split('\n').length
+
+// What the editor opens: a part by index, or from a line to the end of the
+// part holding it (the page shown); neither, the part of Claude's last edit.
+type Opening = { part?: number; line?: number }
+
+async function readSource($: EngineInterface, path: string, opening: Opening = {}): Promise<TexPreviewSource> {
   const raw = await readText(path, $)
   const full = raw.replace(/\r\n/g, '\n')
   const parts = partsOf(full)
-  const part = Math.min(Math.max(0, wanted ?? partOfLastEdit(path, full, parts)), parts.length - 1)
-  const { start = 0, end = full.length } = parts[part] ?? {}
+  const at = opening.line === undefined ? undefined : offsetOfLine(full, opening.line)
+  const wanted = at === undefined ? (opening.part ?? partOfLastEdit(path, full, parts)) : partAt(parts, at)
+  const part = Math.min(Math.max(0, wanted), parts.length - 1)
+  const { start: partStart = 0, end = full.length, label: partLabel = '' } = parts[part] ?? {}
+  const start = at === undefined ? partStart : Math.max(partStart, at)
+  const line = lineOfOffset(full, start)
+  const name = parts.length > 1 ? partLabel.trim() : ''
+  const label = start === partStart ? name : [name, `a partir da linha ${line}`].filter(Boolean).join(' · ')
   const text = full.slice(start, end)
 
-  return { path, full, parts, part, text, draft: text, isCrlf: raw.includes('\r\n') }
+  return { path, full, parts, part, start, end, label, text, draft: text, isCrlf: raw.includes('\r\n') }
 }
 
-async function openSource($: EngineInterface, path: string, wanted?: number) {
-  const source = await readSource($, path, wanted)
+async function openSource($: EngineInterface, path: string, opening: Opening = {}) {
+  const source = await readSource($, path, opening)
   const { root } = await read($, view)
   const files = root ? await texFiles($, root) : [path]
   await update($, view, (v): TexPreviewView => ({
@@ -517,6 +545,57 @@ async function openSource($: EngineInterface, path: string, wanted?: number) {
     source,
     files: files.includes(path) ? files : [path, ...files],
   }))
+}
+
+// The source line a point of a page comes from, by SyncTeX's inverse search;
+// the point in big points from the page's top left.
+async function sourceAt(
+  $: EngineInterface,
+  pdf: string,
+  page: number,
+  x: number,
+  y: number,
+): Promise<{ file: string; line: number } | undefined> {
+  const ran = await $.process
+    .run(['synctex', 'edit', '-o', `${page}:${x}:${y}:${baseOf(pdf)}`], { cwd: dirOf(pdf), timeoutMs: 30_000 })
+    .catch(() => undefined)
+  const input = ran && /^Input:(.+)$/m.exec(ran.stdout)?.[1]?.trim()
+  const line = ran && Number(/^Line:(\d+)/m.exec(ran.stdout)?.[1] ?? 0)
+  if (!input || !line) return undefined
+  // An absolute path, or one relative to the PDF's folder, `./` steps dropped.
+  const path = slash(/^([A-Za-z]:)?\//.test(slash(input)) ? input : `${dirOf(pdf)}/${input}`).replace(/\/\.\//g, '/')
+
+  return { file: path, line }
+}
+
+// The editor, opened where the page shown begins. A point of a page answers
+// the line its paragraph ends on, so points down the page are asked and the
+// least line of the file most of them name is taken, then moved back to the
+// start of its paragraph. Without an answer, the file Claude last edited.
+async function openAtPage($: EngineInterface) {
+  const { pdf, page, root, lastFile } = await read($, view)
+  const fallback = lastFile ?? root
+  if (pdf === undefined) {
+    if (fallback) await openSource($, fallback)
+    return
+  }
+  const hits: { file: string; line: number }[] = []
+  for (const y of PAGE_PROBES) {
+    const hit = await sourceAt($, pdf, page, PAGE_PROBE_X, y)
+    if (hit) hits.push(hit)
+  }
+  const counts = new Map<string, number>()
+  for (const hit of hits) counts.set(hit.file, (counts.get(hit.file) ?? 0) + 1)
+  const file = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+  if (file === undefined) {
+    if (fallback) await openSource($, fallback)
+    return
+  }
+  const line = Math.min(...hits.filter(hit => hit.file === file).map(hit => hit.line))
+  const lines = (await readText(file, $)).replace(/\r\n/g, '\n').split('\n')
+  let start = line
+  while (start > 1 && (lines[start - 2] ?? '').trim() !== '') start--
+  await openSource($, file, { line: start })
 }
 
 // Puts the draft back in its place in the file, then shows the PDF at the
@@ -530,19 +609,25 @@ async function saveSource($: EngineInterface, draft: string) {
     await update($, view, v => ({ ...v, source: v.source && { ...v.source, isStale: true } }))
     return
   }
-  const { start = 0, end = source.full.length } = source.parts[source.part] ?? {}
+  const { start, end } = source
   const full = source.full.slice(0, start) + draft + source.full.slice(end)
   await $.fs.write(source.path, source.isCrlf ? full.replace(/\n/g, '\r\n') : full)
 
-  // The same part, found again by where it starts, now holding the draft.
+  // The same stretch, now holding the draft.
   const parts = partsOf(full)
-  const part = partAt(parts, start)
-  const { start: from = 0, end: to = full.length } = parts[part] ?? {}
-  const text = full.slice(from, to)
   await update($, view, (v): TexPreviewView => ({
     ...v,
     mode: 'pdf',
-    source: v.source && { ...v.source, full, parts, part, text, draft: text, isStale: false },
+    source: v.source && {
+      ...v.source,
+      full,
+      parts,
+      part: partAt(parts, start),
+      end: start + draft.length,
+      text: draft,
+      draft,
+      isStale: false,
+    },
   }))
   pendingEdit = { file: source.path, oldText: source.text, newText: draft }
   schedule($)
@@ -553,7 +638,7 @@ async function onDiskChange($: EngineInterface, path: string) {
   const { source } = await read($, view)
   if (source === undefined || source.path !== path) return
   if (source.draft === source.text) {
-    const fresh = await readSource($, path, source.part)
+    const fresh = await readSource($, path, { line: lineOfOffset(source.full, source.start) })
     await update($, view, v => ({ ...v, source: fresh }))
   } else {
     await update($, view, v => ({ ...v, source: v.source && { ...v.source, isStale: true } }))
@@ -623,6 +708,8 @@ export const register: Register = on => {
       const top = v.root ? `${dirOf(v.root)}/` : ''
       const hasParts = source.parts.length > 1
       const rows = Math.max(10, e.props.scroll.bodyRows - (hasParts ? 11 : 8))
+      // Opened at the page shown, partway into its part.
+      const isMidPart = source.start > (source.parts[source.part]?.start ?? 0)
       const setDraft = (draft: string) =>
         update($, view, x => ({ ...x, source: x.source && { ...x.source, draft } }))
 
@@ -630,7 +717,7 @@ export const register: Register = on => {
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" gap={1} flexWrap="wrap">
             <Text bold>{baseOf(source.path)}</Text>
-            {hasParts && <Text>{`· ${source.parts[source.part]?.label.trim() ?? ''}`}</Text>}
+            {source.label !== '' && <Text>{`· ${source.label}`}</Text>}
             <Text dimColor>
               {isDirty ? 'não salvo · Enter salva, Shift+Enter quebra a linha' : 'sem mudanças'}
             </Text>
@@ -650,6 +737,16 @@ export const register: Register = on => {
               />
             )}
             {isDirty && <Button key="discard" label="Descartar" onPress={() => void setDraft(source.text)} />}
+            {isMidPart && (
+              <Button
+                key="whole"
+                label={hasParts ? 'Ver a seção inteira' : 'Ver o arquivo inteiro'}
+                onPress={() => {
+                  if (isDirty) $.ui.toast('Salve ou descarte as mudanças antes.')
+                  else void openSource($, source.path, { part: source.part })
+                }}
+              />
+            )}
           </Box>
           {Select && files.length > 1 && (
             <Select
@@ -674,7 +771,7 @@ export const register: Register = on => {
               options={source.parts.map((part, i) => ({ value: String(i), label: part.label }))}
               onSelect={value => {
                 if (isDirty) $.ui.toast('Salve ou descarte as mudanças antes de trocar de seção.')
-                else void openSource($, source.path, Number(value))
+                else void openSource($, source.path, { part: Number(value) })
               }}
             />
           )}
@@ -686,7 +783,7 @@ export const register: Register = on => {
               <Button
                 key="reload"
                 label="Recarregar (descarta o seu texto)"
-                onPress={() => void openSource($, source.path, source.part)}
+                onPress={() => void openSource($, source.path, { line: lineOfOffset(source.full, source.start) })}
               />
             </Box>
           )}
@@ -807,15 +904,8 @@ export const register: Register = on => {
             }}
           />
           {v.pdf && <Button key="open" label="Abrir PDF" onPress={() => v.pdf && void openPdf($, v.pdf)} />}
-          {Input && (v.lastFile ?? v.root) && (
-            <Button
-              key="edit"
-              label="Editar .tex"
-              onPress={() => {
-                const path = v.lastFile ?? v.root
-                if (path) void openSource($, path)
-              }}
-            />
+          {Input && v.root && (
+            <Button key="edit" label="Editar esta página" onPress={() => void openAtPage($)} />
           )}
         </Box>
         {v.errors.length > 0 && (
